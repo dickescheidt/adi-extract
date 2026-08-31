@@ -1,0 +1,12 @@
+out/
+obj/
+*.obj
+*.pdb
+*.ilk
+_probe*.py
+FORMAT.md
+PROGRESS.md
+*.adi
+*.index
+adi-extract.exe
+*.exe
