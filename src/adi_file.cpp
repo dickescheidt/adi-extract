@@ -11,6 +11,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_shim.hpp"
 #endif
 
 namespace adi {
@@ -91,7 +93,6 @@ uint32_t crc32_ieee(const uint8_t* data, size_t n, uint32_t seed) {
 }
 
 AdiFile::AdiFile(std::filesystem::path path) : path_(std::move(path)) {
-#ifdef _WIN32
     HANDLE h = CreateFileW(path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,
                            nullptr);
@@ -105,9 +106,6 @@ AdiFile::AdiFile(std::filesystem::path path) : path_(std::move(path)) {
         throw std::runtime_error("GetFileSizeEx failed");
     }
     file_size_ = static_cast<uint64_t>(sz.QuadPart);
-#else
-    throw std::runtime_error("Windows-only");
-#endif
     if (file_size_ < 32) {
         throw std::runtime_error("file too small to be an AOMEI .adi image");
     }
@@ -116,11 +114,9 @@ AdiFile::AdiFile(std::filesystem::path path) : path_(std::move(path)) {
 }
 
 AdiFile::~AdiFile() {
-#ifdef _WIN32
     if (handle_) {
         CloseHandle(static_cast<HANDLE>(handle_));
     }
-#endif
 }
 
 void AdiFile::read(uint64_t offset, void* dst, size_t n) const {
@@ -130,7 +126,6 @@ void AdiFile::read(uint64_t offset, void* dst, size_t n) const {
     if (offset + n > file_size_) {
         throw std::runtime_error("read past end of file");
     }
-#ifdef _WIN32
     HANDLE h = static_cast<HANDLE>(handle_);
     LARGE_INTEGER li;
     li.QuadPart = static_cast<LONGLONG>(offset);
@@ -148,7 +143,6 @@ void AdiFile::read(uint64_t offset, void* dst, size_t n) const {
         out += got;
         left -= got;
     }
-#endif
 }
 
 std::vector<uint8_t> AdiFile::read_vec(uint64_t offset, size_t n) const {

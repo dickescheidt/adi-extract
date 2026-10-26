@@ -10,3 +10,14 @@ PROGRESS.md
 *.index
 adi-extract.exe
 *.exe
+
+# POSIX build outputs and scratch files
+/adi-extract
+*.o
+build/
+map.csv
+report.txt
+scan.txt
+disk.img
+*.bundle
+*.patch

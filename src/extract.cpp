@@ -9,6 +9,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <system_error>
 #include <unordered_set>
 #include <vector>
 
@@ -18,8 +19,12 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifdef _WIN32
 #include <windows.h>
 #include <winioctl.h>
+#else
+#include "win32_shim.hpp"
+#endif
 
 namespace fs = std::filesystem;
 
@@ -118,14 +123,23 @@ std::wstring sanitize(std::wstring name) {
 }
 
 std::wstring long_path(const fs::path& p) {
+#ifdef _WIN32
     std::wstring s = fs::absolute(p).wstring();
     if (s.rfind(L"\\\\?\\", 0) != 0) {
         s = L"\\\\?\\" + s;
     }
     return s;
+#else
+    return fs::absolute(p).wstring();
+#endif
 }
 
 bool make_dirs(const fs::path& p) {
+#ifndef _WIN32
+    std::error_code ec;
+    fs::create_directories(p, ec);
+    return !ec;
+#else
     static std::unordered_set<std::wstring> made;
     const std::wstring full = long_path(p);
     if (made.count(full)) {
@@ -142,6 +156,7 @@ bool make_dirs(const fs::path& p) {
     }
     made.insert(full);
     return true;
+#endif
 }
 
 class FileOut {

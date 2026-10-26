@@ -7,8 +7,12 @@
 #include <iostream>
 #include <stdexcept>
 #include <vector>
+#ifdef _WIN32
 #include <windows.h>
 #include <winioctl.h>
+#else
+#include "win32_shim.hpp"
+#endif
 
 namespace adi {
 namespace {

@@ -14,7 +14,11 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "win32_shim.hpp"
+#endif
 
 namespace adi {
 namespace {
