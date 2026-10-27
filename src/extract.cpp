@@ -1,6 +1,7 @@
 #include "extract.hpp"
 
 #include "codec.hpp"
+#include "text.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -12,6 +13,8 @@
 #include <system_error>
 #include <unordered_set>
 #include <vector>
+#include <climits>
+#include <cstdint>
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -89,9 +92,15 @@ std::wstring widen(const std::string& s) {
     if (s.empty()) {
         return {};
     }
-    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), nullptr, 0);
+    const size_t len = std::min<size_t>(s.size(), INT_MAX);
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(len), nullptr, 0);
+    if (n <= 0) {
+        return {};
+    }
     std::wstring w(size_t(n), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), w.data(), n);
+    if (MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(len), w.data(), n) <= 0) {
+        return {};
+    }
     return w;
 }
 
@@ -99,10 +108,17 @@ std::string narrow(const std::wstring& w) {
     if (w.empty()) {
         return {};
     }
-    const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), int(w.size()), nullptr, 0, nullptr,
-                                      nullptr);
+    const size_t len = std::min<size_t>(w.size(), INT_MAX);
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(len), nullptr, 0,
+                                      nullptr, nullptr);
+    if (n <= 0) {
+        return {};
+    }
     std::string s(size_t(n), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.data(), int(w.size()), s.data(), n, nullptr, nullptr);
+    if (WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(len), s.data(), n, nullptr,
+                            nullptr) <= 0) {
+        return {};
+    }
     return s;
 }
 
@@ -206,7 +222,7 @@ private:
 
 struct Run {
     uint64_t vcn = 0;
-    int64_t lcn = 0;
+    uint64_t lcn = 0;
     uint64_t count = 0;
     bool sparse = false;
 };
@@ -225,13 +241,15 @@ struct Attr {
 };
 
 bool parse_runs(const uint8_t* p, const uint8_t* end, std::vector<Run>* out) {
-    int64_t lcn = 0;
+    uint64_t lcn = 0;  // bit pattern; unsigned wraparound is defined
     uint64_t vcn = 0;
     while (p < end && *p) {
         const uint8_t head = *p++;
         const int nlen = head & 0x0f;
         const int noff = head >> 4;
-        if (nlen == 0 || nlen > 8 || noff > 8 || p + nlen + noff > end) {
+        const size_t left = static_cast<size_t>(end - p);
+        if (nlen == 0 || nlen > 8 || noff > 8 ||
+            static_cast<size_t>(nlen) + static_cast<size_t>(noff) > left) {
             return false;
         }
         uint64_t count = 0;
@@ -239,22 +257,35 @@ bool parse_runs(const uint8_t* p, const uint8_t* end, std::vector<Run>* out) {
             count = (count << 8) | p[i];
         }
         p += nlen;
+        if (count == 0 || count > UINT64_MAX - vcn) {
+            return false;  // zero-length run would hang read_runs()
+        }
         Run r;
         r.vcn = vcn;
         r.count = count;
         if (noff == 0) {
             r.sparse = true;
         } else {
-            int64_t delta = static_cast<int8_t>(p[noff - 1]);
-            for (int i = noff - 2; i >= 0; --i) {
-                delta = (delta << 8) | p[i];
+            uint64_t raw = 0;
+            for (int i = noff - 1; i >= 0; --i) {
+                raw = (raw << 8) | p[i];
+            }
+            // Sign-extend from noff*8 bits without shifting a negative value.
+            if (noff < 8) {
+                const uint64_t sign = uint64_t(1) << (noff * 8 - 1);
+                if (raw & sign) {
+                    raw |= ~uint64_t(0) << (noff * 8);
+                }
             }
             p += noff;
-            lcn += delta;
+            lcn += raw;
             r.lcn = lcn;
         }
         vcn += count;
         out->push_back(r);
+        if (out->size() > 100000) {
+            return false;  // a corrupt run list must not exhaust memory
+        }
     }
     return true;
 }
@@ -268,15 +299,24 @@ struct NtfsVolume {
     uint64_t mft_off = 0;
     std::vector<Run> mft_runs;
 
-    uint64_t cluster_bytes(uint64_t lcn) const { return part_off + lcn * cluster_size; }
+    uint64_t cluster_bytes(uint64_t lcn) const {
+        if (lcn > UINT64_MAX / cluster_size) {
+            return UINT64_MAX;
+        }
+        const uint64_t v = lcn * cluster_size;
+        return v > UINT64_MAX - part_off ? UINT64_MAX : part_off + v;
+    }
 
     bool read_runs(const std::vector<Run>& runs, uint64_t off, uint8_t* dst, size_t n) const {
+        if (cluster_size == 0) {
+            return false;
+        }
         while (n) {
             const uint64_t vcn = off / cluster_size;
-            const uint32_t in_cl = static_cast<uint32_t>(off % cluster_size);
+            const uint64_t in_cl = off % cluster_size;
             const Run* hit = nullptr;
             for (const auto& r : runs) {
-                if (vcn >= r.vcn && vcn < r.vcn + r.count) {
+                if (vcn >= r.vcn && vcn - r.vcn < r.count) {
                     hit = &r;
                     break;
                 }
@@ -285,13 +325,33 @@ struct NtfsVolume {
                 std::memset(dst, 0, n);
                 return true;
             }
-            const uint64_t left_in_run = (hit->vcn + hit->count - vcn) * cluster_size - in_cl;
+            const uint64_t clusters_left = hit->count - (vcn - hit->vcn);
+            uint64_t left_in_run = 0;
+            if (clusters_left <= UINT64_MAX / cluster_size) {
+                const uint64_t span = clusters_left * cluster_size;
+                left_in_run = span > in_cl ? span - in_cl : 0;
+            } else {
+                left_in_run = UINT64_MAX;
+            }
             const size_t chunk = static_cast<size_t>(std::min<uint64_t>(n, left_in_run));
+            if (chunk == 0) {
+                std::memset(dst, 0, n);
+                return true;
+            }
             if (hit->sparse) {
                 std::memset(dst, 0, chunk);
-            } else if (!disk->read(cluster_bytes(uint64_t(hit->lcn) + (vcn - hit->vcn)) + in_cl,
-                                  dst, chunk)) {
-                return false;
+            } else {
+                const uint64_t rel = vcn - hit->vcn;
+                if (rel > UINT64_MAX - hit->lcn) {
+                    return false;
+                }
+                const uint64_t base = cluster_bytes(hit->lcn + rel);
+                if (base == UINT64_MAX || in_cl > UINT64_MAX - base) {
+                    return false;
+                }
+                if (!disk->read(base + in_cl, dst, chunk)) {
+                    return false;
+                }
             }
             dst += chunk;
             off += chunk;
@@ -301,14 +361,20 @@ struct NtfsVolume {
     }
 
     void fixup(uint8_t* rec, size_t n) const {
-        const uint16_t usa = rd16(rec + 4);
-        const uint16_t usc = rd16(rec + 6);
-        if (usa + 2 * usc > n || usc == 0) {
+        if (n < 8 || sector_size < 2) {
             return;
         }
-        for (uint16_t i = 1; i < usc; ++i) {
-            const size_t at = size_t(i) * sector_size - 2;
-            if (at + 2 > n) {
+        const size_t usa = rd16(rec + 4);
+        const size_t usc = rd16(rec + 6);
+        if (usc == 0 || usa > n || usc > (n - usa) / 2) {
+            return;
+        }
+        for (size_t i = 1; i < usc; ++i) {
+            if (i > (SIZE_MAX - 2) / sector_size) {
+                break;
+            }
+            const size_t at = i * sector_size - 2;
+            if (at > n || n - at < 2) {
                 break;
             }
             std::memcpy(rec + at, rec + usa + 2 * i, 2);
@@ -317,6 +383,9 @@ struct NtfsVolume {
 
     bool read_record(uint64_t index, std::vector<uint8_t>* rec) const {
         rec->assign(record_size, 0);
+        if (record_size == 0 || index > UINT64_MAX / record_size) {
+            return false;
+        }
         if (!read_runs(mft_runs, index * record_size, rec->data(), record_size)) {
             return false;
         }
@@ -329,6 +398,9 @@ struct NtfsVolume {
 };
 
 const uint8_t* attr_end(const std::vector<uint8_t>& rec) {
+    if (rec.size() < 0x1c) {
+        return rec.data();
+    }
     const uint32_t used = rd32(rec.data() + 0x18);
     const size_t lim = used && used <= rec.size() ? used : rec.size();
     return rec.data() + lim;
@@ -337,15 +409,23 @@ const uint8_t* attr_end(const std::vector<uint8_t>& rec) {
 Attr read_attr(const NtfsVolume& vol, const std::vector<uint8_t>& rec, uint32_t type,
                bool unnamed_only) {
     Attr out;
-    const uint8_t* p = rec.data() + rd16(rec.data() + 0x14);
-    const uint8_t* end = attr_end(rec);
-    while (p + 16 <= end) {
+    if (rec.size() < 0x1c) {
+        return out;
+    }
+    // Work with offsets, not raw pointers: `p + uint32_t` can overflow the
+    // pointer itself, and `voff + vlen` wraps in uint32 arithmetic. Both were
+    // attacker-controlled through the MFT record.
+    const size_t lim = static_cast<size_t>(attr_end(rec) - rec.data());
+    size_t at = rd16(rec.data() + 0x14);
+    while (at <= lim && lim - at >= 16) {
+        const uint8_t* p = rec.data() + at;
+        const size_t avail = lim - at;
         const uint32_t t = rd32(p);
         if (t == 0xffffffff) {
             break;
         }
         const uint32_t len = rd32(p + 4);
-        if (len < 16 || p + len > end) {
+        if (len < 16 || len > avail) {
             break;
         }
         if (t == type && (!unnamed_only || p[9] == 0)) {
@@ -357,12 +437,16 @@ Attr read_attr(const NtfsVolume& vol, const std::vector<uint8_t>& rec, uint32_t 
             if (out.resident) {
                 const uint32_t vlen = rd32(p + 0x10);
                 const uint16_t voff = rd16(p + 0x14);
-                if (voff + vlen <= len) {
+                if (static_cast<uint64_t>(voff) + vlen <= len &&
+                    static_cast<uint64_t>(voff) + vlen <= avail) {
                     out.data_size = vlen;
                     out.init_size = vlen;
                     out.resident_data.assign(p + voff, p + voff + vlen);
                 }
             } else {
+                if (len < 0x40) {
+                    return out;
+                }
                 out.compression_unit = rd16(p + 0x22);
                 out.start_vcn = rd64(p + 0x10);
                 out.data_size = rd64(p + 0x30);
@@ -374,7 +458,7 @@ Attr read_attr(const NtfsVolume& vol, const std::vector<uint8_t>& rec, uint32_t 
             }
             return out;
         }
-        p += len;
+        at += len;
     }
     (void)vol;
     return out;
@@ -451,37 +535,45 @@ struct NameInfo {
 
 NameInfo read_name(const std::vector<uint8_t>& rec) {
     NameInfo best;
-    const uint8_t* p = rec.data() + rd16(rec.data() + 0x14);
-    const uint8_t* end = attr_end(rec);
-    while (p + 16 <= end) {
+    if (rec.size() < 0x1c) {
+        return best;
+    }
+    const size_t lim = static_cast<size_t>(attr_end(rec) - rec.data());
+    size_t at = rd16(rec.data() + 0x14);
+    while (at <= lim && lim - at >= 16) {
+        const uint8_t* p = rec.data() + at;
+        const size_t avail = lim - at;
         const uint32_t t = rd32(p);
         if (t == 0xffffffff) {
             break;
         }
         const uint32_t len = rd32(p + 4);
-        if (len < 16 || p + len > end) {
+        if (len < 16 || len > avail) {
             break;
         }
         if (t == 0x30 && p[8] == 0) {
             const uint16_t voff = rd16(p + 0x14);
             const uint32_t vlen = rd32(p + 0x10);
-            if (voff + vlen <= len && vlen >= 0x42) {
+            if (static_cast<uint64_t>(voff) + vlen <= len && vlen >= 0x42 &&
+                static_cast<uint64_t>(voff) + 0x42 <= len) {
                 const uint8_t* v = p + voff;
                 const uint8_t nlen = v[0x40];
                 const uint8_t space = v[0x41];
-                if (0x42 + size_t(nlen) * 2 <= vlen) {
+                if (0x42ull + static_cast<uint64_t>(nlen) * 2 <= vlen) {
                     const uint8_t rank[4] = {1, 0, 3, 0};
                     const uint8_t r = space < 4 ? rank[space] : 4;
                     const uint8_t br = best.space < 4 ? rank[best.space] : 5;
                     if (best.space == 0xff || r < br) {
                         best.space = space;
                         best.parent = rd64(v) & 0x0000ffffffffffffull;
-                        best.name.assign(reinterpret_cast<const wchar_t*>(v + 0x42), nlen);
+                        // UTF-16LE on disk, exactly nlen code units. Decoding via
+                        // reinterpret_cast<wchar_t*> would read 2x that on Linux.
+                        best.name = text::utf16le_to_wstring(v + 0x42, nlen);
                     }
                 }
             }
         }
-        p += len;
+        at += len;
     }
     return best;
 }
@@ -531,8 +623,16 @@ bool write_ntfs_data(const NtfsVolume& vol, const Attr& data, const fs::path& ou
         *bytes += size;
         return true;
     }
+    if (data.compression_unit > 16) {
+        rep->add("invalid NTFS compression unit", narrow(out.wstring()));
+        return false;
+    }
     const uint32_t cu_clusters = 1u << data.compression_unit;
     const uint64_t cu_bytes = uint64_t(cu_clusters) * vol.cluster_size;
+    if (cu_bytes == 0 || cu_bytes > (64ull << 20)) {
+        rep->add("NTFS compression unit too large", narrow(out.wstring()));
+        return false;
+    }
     std::vector<uint8_t> in(static_cast<size_t>(cu_bytes));
     std::vector<uint8_t> out_buf(static_cast<size_t>(cu_bytes));
     uint64_t at = 0;
@@ -857,10 +957,9 @@ void walk_fat_dir(const FatVolume& vol, uint32_t cluster, const std::vector<uint
             continue;
         }
         if (e[11] == 0x0f) {
-            std::wstring part;
-            part.assign(reinterpret_cast<const wchar_t*>(e + 1), 5);
-            part.append(reinterpret_cast<const wchar_t*>(e + 14), 6);
-            part.append(reinterpret_cast<const wchar_t*>(e + 28), 2);
+            std::wstring part = text::utf16le_to_wstring(e + 1, 5);
+            part += text::utf16le_to_wstring(e + 14, 6);
+            part += text::utf16le_to_wstring(e + 28, 2);
             lfn.push_back(std::move(part));
             continue;
         }

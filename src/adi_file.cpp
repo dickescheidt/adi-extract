@@ -1,4 +1,5 @@
 #include "adi_file.hpp"
+#include "text.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -46,38 +47,17 @@ std::string Guid::to_string() const {
 }
 
 std::string utf16le_z(const uint8_t* data, size_t nbytes) {
-    std::u16string u;
-    u.reserve(nbytes / 2);
-    for (size_t i = 0; i + 1 < nbytes; i += 2) {
-        char16_t ch = static_cast<char16_t>(read_u16(data + i));
-        if (ch == 0) {
+    size_t units = nbytes / 2;
+    for (size_t i = 0; i < units; ++i) {
+        if (read_u16(data + 2 * i) == 0) {
+            units = i;
             break;
         }
-        u.push_back(ch);
     }
-    if (u.empty()) {
-        return {};
-    }
-    std::wstring w(u.begin(), u.end());
-#ifdef _WIN32
-    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
-                                nullptr, 0, nullptr, nullptr);
-    std::string out(n, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), out.data(),
-                        n, nullptr, nullptr);
-    return out;
-#else
-    std::string out;
-    out.reserve(u.size());
-    for (char16_t ch : u) {
-        if (ch < 0x80) {
-            out.push_back(static_cast<char>(ch));
-        } else {
-            out.push_back('?');
-        }
-    }
-    return out;
-#endif
+    // Common helper decodes UTF-16LE with an explicit element count. Upstream
+    // used wchar_t here, which is 2 bytes on Windows but 4 on Linux; casting
+    // the on-disk bytes to wchar_t* read twice as much as the field contains.
+    return text::utf16le_to_utf8(data, units);
 }
 
 uint32_t crc32_ieee(const uint8_t* data, size_t n, uint32_t seed) {
@@ -222,7 +202,7 @@ void AdiFile::print_info() const {
     std::cout << "file:     " << path_.string() << "\n";
     std::cout << "size:     " << file_size_ << " bytes ("
               << std::fixed << std::setprecision(2)
-              << (file_size_ / 1024.0 / 1024.0 / 1024.0) << " GiB)\n";
+              << (static_cast<double>(file_size_) / 1024.0 / 1024.0 / 1024.0) << " GiB)\n";
     std::cout << "\n[BIFH header]\n";
     std::cout << "  magic:     BIFH\n";
     std::cout << "  size:      " << header_.size << " (0x" << std::hex << header_.size

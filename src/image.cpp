@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -145,23 +146,49 @@ public:
     SparseImage& operator=(const SparseImage&) = delete;
 
     uint64_t write_at(uint64_t off, const uint8_t* p, size_t n) {
-        if (off != pos_) {
+        if (!n) {
+            return 0;
+        }
+        // A hole reads back as zeros, so leading/trailing zero bytes can be
+        // skipped entirely. AOMEI often stores whole clusters of zeros (it
+        // backs up sectors, not files); writing those explicitly allocates
+        // real blocks and destroys sparseness on Linux, where the Win32
+        // FSCTL_SET_SPARSE shim is a no-op.
+        size_t first = 0;
+        while (first < n && p[first] == 0) {
+            ++first;
+        }
+        if (first == n) {
             LARGE_INTEGER li;
-            li.QuadPart = static_cast<LONGLONG>(off);
+            li.QuadPart = static_cast<LONGLONG>(off + n);
             SetFilePointerEx(h_, li, nullptr, FILE_BEGIN);
-            pos_ = off;
+            pos_ = off + n;
+            return n;  // logical length, for the caller's counters
+        }
+        size_t last = n;
+        while (last > first && p[last - 1] == 0) {
+            --last;
+        }
+        const uint64_t dst = off + first;
+        const size_t len = last - first;
+        if (dst != pos_) {
+            LARGE_INTEGER li;
+            li.QuadPart = static_cast<LONGLONG>(dst);
+            SetFilePointerEx(h_, li, nullptr, FILE_BEGIN);
+            pos_ = dst;
         }
         uint64_t done = 0;
-        while (done < n) {
+        while (done < len) {
             DWORD wrote = 0;
-            if (!WriteFile(h_, p + done, static_cast<DWORD>(n - done), &wrote, nullptr) ||
+            if (!WriteFile(h_, p + first + done, static_cast<DWORD>(len - done), &wrote,
+                           nullptr) ||
                 wrote == 0) {
                 break;
             }
             done += wrote;
         }
         pos_ += done;
-        return done;
+        return done == len ? n : done;
     }
     void set_size(uint64_t size) {
         LARGE_INTEGER li;
@@ -286,7 +313,7 @@ void write_gpt(SparseImage& img, const SectorMap& map) {
         put64(h.data() + 32, other);
         put64(h.data() + 40, 34);
         put64(h.data() + 48, last - 33);
-        for (int i = 0; i < 16; ++i) {
+        for (size_t i = 0; i < 16; ++i) {
             h[56 + i] = uint8_t(0x40 + i);
         }
         put64(h.data() + 72, ent_lba);
@@ -305,7 +332,8 @@ void write_gpt(SparseImage& img, const SectorMap& map) {
 void probe_volume(const AdiFile& file, const std::vector<BlockRec>& blocks, Volume* v) {
     constexpr size_t kMaxProbe = 512;
     const size_t stop = std::min(v->last + 1, v->first + kMaxProbe);
-    std::vector<BlockRec> sub(blocks.begin() + v->first, blocks.begin() + stop);
+    std::vector<BlockRec> sub(blocks.begin() + static_cast<std::ptrdiff_t>(v->first),
+                                   blocks.begin() + static_cast<std::ptrdiff_t>(stop));
     Lz4Stream st(file, sub);
     const BlockRec* b = nullptr;
     const uint8_t* data = nullptr;
@@ -341,58 +369,228 @@ void probe_volume(const AdiFile& file, const std::vector<BlockRec>& blocks, Volu
     v->cluster = cluster ? cluster : 512;
 }
 
+struct BootHit {
+    uint64_t stream_off = 0;  // region*256KiB + unit*cluster
+    uint64_t lba = 0;         // hidden_sectors from the boot sector
+    uint64_t sectors = 0;     // total_sectors (+1 for NTFS)
+    uint32_t cluster = 0;     // bytes_per_sector * sectors_per_cluster
+    std::string fs;
+    std::string label;
+};
+
+struct BootScan {
+    std::vector<BootHit> hits;
+    bool region0_has_mbr = false;
+};
+
+// Decompress the whole block stream once and collect every volume boot record.
+// probe_volume() above only inspects region 0 of each index-chain run, which
+// misses most partitions when AOMEI writes a multi-partition disk as one
+// contiguous chain (the common case). Each boot sector knows its own LBA via
+// hidden_sectors, so it anchors that partition on the disk.
+BootScan scan_boot_sectors(const AdiFile& file, const std::vector<BlockRec>& blocks) {
+    BootScan out;
+    if (blocks.empty()) {
+        return out;
+    }
+    Lz4Stream st(file, blocks);
+    const BlockRec* b = nullptr;
+    const uint8_t* data = nullptr;
+    size_t n = 0;
+    std::vector<uint64_t> seen;
+    while ((b = st.next_chunk(&data, &n)) != nullptr) {
+        if (n != b->usize) {
+            continue;
+        }
+        BlockLayout lay;
+        if (!split_block(data, b->usize, 0, &lay) || lay.units == 0 ||
+            lay.cluster < kSector) {
+            continue;
+        }
+        uint32_t slot = 0;
+        for (uint32_t u = 0; u < kRegion / lay.cluster && slot < lay.units; ++u) {
+            if (!unit_present(data, lay, u)) {
+                continue;
+            }
+            const uint8_t* src = data + lay.hdr + size_t(slot) * lay.cluster;
+            ++slot;
+            const uint64_t stream_off = region_offset(b->region) + uint64_t(u) * lay.cluster;
+            if (b->region == 0 && u == 0 && src[kSector - 2] == 0x55 &&
+                src[kSector - 1] == 0xAA &&
+                (src[446 + 4] == 0xEE ||
+                 (lay.cluster >= 2 * kSector &&
+                  std::memcmp(src + kSector, "EFI PART", 8) == 0))) {
+                out.region0_has_mbr = true;
+            }
+            BootSector bs;
+            if (!parse_boot_sector(src, lay.cluster, &bs) || !bs.hidden_sectors ||
+                !bs.bytes_per_sector || !bs.sectors_per_cluster) {
+                continue;
+            }
+            if (std::find(seen.begin(), seen.end(), bs.hidden_sectors) != seen.end()) {
+                continue;  // NTFS mirror boot sector or a duplicate hit
+            }
+            seen.push_back(bs.hidden_sectors);
+            BootHit h;
+            h.stream_off = stream_off;
+            h.lba = bs.hidden_sectors;
+            h.sectors = bs.total_sectors + (bs.fs == "NTFS" ? 1 : 0);
+            h.cluster = bs.bytes_per_sector * bs.sectors_per_cluster;
+            h.fs = bs.fs;
+            h.label = bs.label;
+            out.hits.push_back(h);
+        }
+    }
+    std::sort(out.hits.begin(), out.hits.end(),
+              [](const BootHit& x, const BootHit& y) {
+                  return x.stream_off < y.stream_off;
+              });
+    return out;
+}
+
 }  // namespace
 
 SectorMap discover_map(const AdiFile& file, const std::vector<BlockRec>& blocks,
                        const std::filesystem::path& out_csv) {
     SectorMap map;
     map.sector_size = kSector;
-    map.source = "volume runs from the block index, region*256KiB + unit*cluster";
     if (blocks.empty()) {
         return map;
     }
-    std::vector<uint32_t> max_region;
-    for (size_t i = 0; i < blocks.size(); ++i) {
-        if (i == 0 || blocks[i].off != blocks[i - 1].end()) {
+
+    uint32_t max_region = 0;
+    for (const auto& b : blocks) {
+        max_region = std::max(max_region, b.region);
+    }
+    const uint64_t stream_span = (uint64_t(max_region) + 1) * kRegion;
+
+    const BootScan scan = scan_boot_sectors(file, blocks);
+
+    // Every boot sector must agree on (LBA*512 - stream offset). Then the
+    // block stream is a whole-disk coordinate space shifted by one constant,
+    // and every cluster can be placed at (stream offset + origin).
+    bool consistent = !scan.hits.empty();
+    int64_t delta = 0;
+    if (!scan.hits.empty()) {
+        delta = int64_t(scan.hits[0].lba * kSector) - int64_t(scan.hits[0].stream_off);
+        if (delta < 0) {
+            consistent = false;
+        }
+    }
+    for (const auto& h : scan.hits) {
+        if (int64_t(h.lba * kSector) - int64_t(h.stream_off) != delta) {
+            consistent = false;
+            break;
+        }
+    }
+
+    std::cout << "  boot sectors: " << scan.hits.size() << "\n";
+    for (const auto& h : scan.hits) {
+        std::cout << "    LBA " << h.lba << " (byte " << h.lba * kSector
+                  << ") at stream " << h.stream_off << " -> origin "
+                  << int64_t(h.lba * kSector) - int64_t(h.stream_off) << "  "
+                  << (h.fs.empty() ? "raw" : h.fs) << " " << h.sectors << " sectors\n";
+    }
+    if (std::getenv("ADI_EXTRACT_LEGACY_MAP")) {
+        consistent = false;  // escape hatch: force the old volume-run layout
+    }
+    std::cout << "  layout: ";
+    if (consistent) {
+        map.passthrough = true;
+        map.origin = uint64_t(delta);
+        map.native_table = (map.origin == 0 && scan.region0_has_mbr);
+        map.source = "whole-disk stream + " + std::to_string(map.origin) + "B origin, " +
+                     std::to_string(scan.hits.size()) + " partitions";
+        std::vector<BootHit> by_lba = scan.hits;
+        std::sort(by_lba.begin(), by_lba.end(),
+                  [](const BootHit& a, const BootHit& b) { return a.lba < b.lba; });
+        const uint64_t end_lba = (map.origin + stream_span + kSector - 1) / kSector;
+        for (const auto& h : by_lba) {
             Volume v;
-            v.first = i;
+            v.first = 0;
+            v.last = blocks.size() - 1;
+            v.fs = h.fs;
+            v.label = h.label;
+            v.cluster = h.cluster ? h.cluster : 512;
+            v.lba = h.lba;
+            v.sectors = h.sectors;
+            v.data_base = 0;
             map.volumes.push_back(v);
-            max_region.push_back(0);
         }
-        map.volumes.back().last = i;
-        map.volumes.back().stored += blocks[i].usize;
-        max_region.back() = std::max(max_region.back(), blocks[i].region);
-    }
-    for (auto& v : map.volumes) {
-        probe_volume(file, blocks, &v);
-    }
-    for (size_t i = 0; i < map.volumes.size(); ++i) {
-        if (!map.volumes[i].lba && i) {
-            map.volumes[i].lba = map.volumes[i - 1].lba + map.volumes[i - 1].sectors;
+        for (size_t i = 0; i < map.volumes.size(); ++i) {
+            if (map.volumes[i].sectors) {
+                continue;
+            }
+            const uint64_t end =
+                (i + 1 < map.volumes.size()) ? map.volumes[i + 1].lba : end_lba;
+            if (end > map.volumes[i].lba) {
+                map.volumes[i].sectors = end - map.volumes[i].lba;
+            }
+        }
+        uint64_t volume_end = 0;
+        for (const auto& v : map.volumes) {
+            volume_end = std::max(volume_end, v.lba + v.sectors);
+        }
+        map.disk_sectors = std::max(volume_end, end_lba) + 34;
+        std::cout << "whole-disk stream (origin " << map.origin << " bytes)";
+        if (map.native_table) {
+            std::cout << ", native partition table preserved";
+        }
+    } else {
+        // Fallback: one volume per gap in the compressed block chain.
+        map.source = "volume runs from the block index, region*256KiB + unit*cluster";
+        std::vector<uint32_t> run_max_region;
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            if (i == 0 || blocks[i].off != blocks[i - 1].end()) {
+                Volume v;
+                v.first = i;
+                map.volumes.push_back(v);
+                run_max_region.push_back(0);
+            }
+            map.volumes.back().last = i;
+            map.volumes.back().stored += blocks[i].usize;
+            run_max_region.back() = std::max(run_max_region.back(), blocks[i].region);
+        }
+        for (auto& v : map.volumes) {
+            probe_volume(file, blocks, &v);
+        }
+        for (size_t i = 0; i < map.volumes.size(); ++i) {
+            if (!map.volumes[i].lba && i) {
+                map.volumes[i].lba = map.volumes[i - 1].lba + map.volumes[i - 1].sectors;
+            }
+        }
+        for (size_t i = 0; i < map.volumes.size(); ++i) {
+            Volume& v = map.volumes[i];
+            if (v.sectors) {
+                continue;
+            }
+            const uint64_t span = (uint64_t(run_max_region[i]) + 1) * kRegion / kSector;
+            v.sectors = span;
+            if (i + 1 < map.volumes.size() && map.volumes[i + 1].lba > v.lba) {
+                v.sectors = map.volumes[i + 1].lba - v.lba;
+            }
+        }
+        for (const auto& v : map.volumes) {
+            map.disk_sectors = std::max(map.disk_sectors, v.lba + v.sectors + 34);
+        }
+        std::cout << "legacy volume runs";
+        if (std::getenv("ADI_EXTRACT_LEGACY_MAP")) {
+            std::cout << " (forced by ADI_EXTRACT_LEGACY_MAP)";
+        } else if (!scan.hits.empty()) {
+            std::cout << " (boot-sector origins disagree; falling back to index-run volumes)";
         }
     }
-    for (size_t i = 0; i < map.volumes.size(); ++i) {
-        Volume& v = map.volumes[i];
-        if (v.sectors) {
-            continue;
-        }
-        const uint64_t span = (uint64_t(max_region[i]) + 1) * kRegion / kSector;
-        v.sectors = span;
-        if (i + 1 < map.volumes.size() && map.volumes[i + 1].lba > v.lba) {
-            v.sectors = map.volumes[i + 1].lba - v.lba;
-        }
-    }
-    for (const auto& v : map.volumes) {
-        map.disk_sectors = std::max(map.disk_sectors, v.lba + v.sectors + 34);
-    }
+    std::cout << "\n" << std::flush;
+
     if (!out_csv.empty()) {
         std::ofstream csv(out_csv, std::ios::trunc);
-        csv << "volume,fs,label,lba,sectors,cluster,data_base,blocks,stored_bytes\n";
+        csv << "volume,fs,label,lba,sectors,cluster,data_base,blocks,stored_bytes,origin,passthrough\n";
         for (size_t i = 0; i < map.volumes.size(); ++i) {
             const Volume& v = map.volumes[i];
-            csv << i << "," << v.fs << "," << v.label << "," << v.lba << "," << v.sectors << ","
-                << v.cluster << "," << v.data_base << "," << (v.last - v.first + 1) << ","
-                << v.stored << "\n";
+            csv << i << "," << v.fs << "," << v.label << "," << v.lba << "," << v.sectors
+                << "," << v.cluster << "," << v.data_base << ","
+                << (v.last - v.first + 1) << "," << v.stored << "," << map.origin << ","
+                << (map.passthrough ? 1 : 0) << "\n";
         }
     }
     return map;
@@ -406,7 +604,9 @@ uint64_t reconstruct_image(const AdiFile& file, const std::vector<BlockRec>& blo
     }
     SparseImage img(out_img);
     img.set_size(map.disk_sectors * map.sector_size);
-    write_gpt(img, map);
+    if (!map.native_table) {
+        write_gpt(img, map);
+    }
 
     uint64_t written = 0;
     uint64_t units = 0;
@@ -415,69 +615,67 @@ uint64_t reconstruct_image(const AdiFile& file, const std::vector<BlockRec>& blo
     uint64_t outside = 0;
     uint64_t next_note = 2ull << 30;
 
-    for (size_t vi = 0; vi < map.volumes.size(); ++vi) {
-        const Volume& v = map.volumes[vi];
-        std::cout << "  volume " << vi << " " << (v.fs.empty() ? "raw" : v.fs) << " lba " << v.lba
-                  << ", " << (v.last - v.first + 1) << " blocks, cluster " << v.cluster << "\n"
-                  << std::flush;
-        std::vector<BlockRec> sub(blocks.begin() + v.first, blocks.begin() + v.last + 1);
-        Lz4Stream st(file, sub);
-        const uint64_t vol_off = v.lba * map.sector_size;
-        const uint64_t vol_end = vol_off + v.sectors * map.sector_size;
+    auto emit = [&](const BlockRec& b, const uint8_t* data, size_t n, uint64_t base,
+                    uint64_t limit, uint32_t cluster_hint) {
+        if (n != b.usize) {
+            ++short_blocks;
+            return;
+        }
+        BlockLayout lay;
+        if (!split_block(data, b.usize, cluster_hint, &lay)) {
+            ++odd_blocks;
+            return;
+        }
+        uint32_t slot = 0;
+        uint64_t run_dst = 0;
+        const uint8_t* run_src = nullptr;
+        size_t run_len = 0;
+        auto flush = [&]() {
+            if (run_len) {
+                written += img.write_at(run_dst, run_src, run_len);
+                run_len = 0;
+            }
+        };
+        for (uint32_t u = 0; u < kRegion / lay.cluster && slot < lay.units; ++u) {
+            if (!unit_present(data, lay, u)) {
+                continue;
+            }
+            const uint8_t* src = data + lay.hdr + size_t(slot) * lay.cluster;
+            const uint64_t dst = base + uint64_t(u) * lay.cluster;
+            ++slot;
+            if (dst + lay.cluster > limit) {
+                ++outside;
+                continue;
+            }
+            if (run_len && run_dst + run_len == dst && run_src + run_len == src) {
+                run_len += lay.cluster;
+            } else {
+                flush();
+                run_dst = dst;
+                run_src = src;
+                run_len = lay.cluster;
+            }
+            ++units;
+        }
+        flush();
+    };
 
+    if (map.passthrough) {
+        std::cout << "  reconstructing whole-disk stream, " << map.volumes.size()
+                  << " partitions\n" << std::flush;
+        Lz4Stream st(file, blocks);
         const BlockRec* b = nullptr;
         const uint8_t* data = nullptr;
         size_t n = 0;
+        const uint64_t limit = map.disk_sectors * map.sector_size;
         while ((b = st.next_chunk(&data, &n)) != nullptr) {
             if (max_bytes && written >= max_bytes) {
                 break;
             }
-            if (n != b->usize) {
-                ++short_blocks;
-                continue;
-            }
-            BlockLayout lay;
-            if (!split_block(data, b->usize, v.cluster, &lay)) {
-                ++odd_blocks;
-                continue;
-            }
-            const uint64_t base =
-                vol_off + (b->stream == 0 ? v.data_base : 0) + region_offset(b->region);
-            uint32_t slot = 0;
-            uint64_t run_dst = 0;
-            const uint8_t* run_src = nullptr;
-            size_t run_len = 0;
-            auto flush = [&]() {
-                if (run_len) {
-                    written += img.write_at(run_dst, run_src, run_len);
-                    run_len = 0;
-                }
-            };
-            for (uint32_t u = 0; u < kRegion / lay.cluster && slot < lay.units; ++u) {
-                if (!unit_present(data, lay, u)) {
-                    continue;
-                }
-                const uint8_t* src = data + lay.hdr + size_t(slot) * lay.cluster;
-                const uint64_t dst = base + uint64_t(u) * lay.cluster;
-                ++slot;
-                if (dst + lay.cluster > vol_end) {
-                    ++outside;
-                    continue;
-                }
-                if (run_len && run_dst + run_len == dst && run_src + run_len == src) {
-                    run_len += lay.cluster;
-                } else {
-                    flush();
-                    run_dst = dst;
-                    run_src = src;
-                    run_len = lay.cluster;
-                }
-                ++units;
-            }
-            flush();
+            emit(*b, data, n, map.origin + region_offset(b->region), limit, 0);
             if (written >= next_note) {
                 std::cout << "    " << (written >> 30) << " GiB written, block "
-                          << st.block_index() << "/" << sub.size() << "\n"
+                          << st.block_index() << "/" << blocks.size() << "\n"
                           << std::flush;
                 next_note += 2ull << 30;
             }
@@ -488,6 +686,42 @@ uint64_t reconstruct_image(const AdiFile& file, const std::vector<BlockRec>& blo
         }
         if (st.bad_blocks()) {
             std::cout << "    " << st.bad_blocks() << " blocks decoded to the wrong size\n";
+        }
+    } else {
+        for (size_t vi = 0; vi < map.volumes.size(); ++vi) {
+            const Volume& v = map.volumes[vi];
+            std::cout << "  volume " << vi << " " << (v.fs.empty() ? "raw" : v.fs) << " lba "
+                      << v.lba << ", " << (v.last - v.first + 1) << " blocks, cluster "
+                      << v.cluster << "\n" << std::flush;
+            std::vector<BlockRec> sub(blocks.begin() + static_cast<std::ptrdiff_t>(v.first),
+                                   blocks.begin() + static_cast<std::ptrdiff_t>(v.last + 1));
+            Lz4Stream st(file, sub);
+            const uint64_t vol_off = v.lba * map.sector_size;
+            const uint64_t vol_end = vol_off + v.sectors * map.sector_size;
+            const BlockRec* b = nullptr;
+            const uint8_t* data = nullptr;
+            size_t n = 0;
+            while ((b = st.next_chunk(&data, &n)) != nullptr) {
+                if (max_bytes && written >= max_bytes) {
+                    break;
+                }
+                const uint64_t base =
+                    vol_off + (b->stream == 0 ? v.data_base : 0) + region_offset(b->region);
+                emit(*b, data, n, base, vol_end, v.cluster);
+                if (written >= next_note) {
+                    std::cout << "    " << (written >> 30) << " GiB written, block "
+                              << st.block_index() << "/" << sub.size() << "\n"
+                              << std::flush;
+                    next_note += 2ull << 30;
+                }
+            }
+            if (!st.ok()) {
+                std::cout << "    decode stopped: " << st.error() << " at adi 0x" << std::hex
+                          << st.error_in_pos() << std::dec << "\n";
+            }
+            if (st.bad_blocks()) {
+                std::cout << "    " << st.bad_blocks() << " blocks decoded to the wrong size\n";
+            }
         }
     }
     std::cout << "  " << units << " units placed";

@@ -21,3 +21,6 @@ scan.txt
 disk.img
 *.bundle
 *.patch
+
+# generated dependency files (-MMD)
+*.d

@@ -9,9 +9,12 @@
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
+#include <climits>
+#include <limits>
 #include <fcntl.h>
 #include <string>
 #include <sys/stat.h>
+#include "text.hpp"
 #include <sys/types.h>
 #include <unistd.h>
 #include <vector>
@@ -55,75 +58,22 @@ inline int fd_of(HANDLE h) {
   return static_cast<int>(reinterpret_cast<intptr_t>(h)) - 1;
 }
 
-inline void append_utf8(std::string& out, uint32_t cp) {
-  if (cp == 0 || cp > 0x10ffffu || (cp >= 0xd800u && cp <= 0xdfffu)) {
-    out.push_back('?');
-    return;
-  }
-  if (cp < 0x80) {
-    out.push_back(static_cast<char>(cp));
-  } else if (cp < 0x800) {
-    out.push_back(static_cast<char>(0xc0u | (cp >> 6)));
-    out.push_back(static_cast<char>(0x80u | (cp & 0x3fu)));
-  } else if (cp < 0x10000) {
-    out.push_back(static_cast<char>(0xe0u | (cp >> 12)));
-    out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3fu)));
-    out.push_back(static_cast<char>(0x80u | (cp & 0x3fu)));
-  } else {
-    out.push_back(static_cast<char>(0xf0u | (cp >> 18)));
-    out.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3fu)));
-    out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3fu)));
-    out.push_back(static_cast<char>(0x80u | (cp & 0x3fu)));
-  }
+inline std::string wide_to_utf8(const wchar_t* src, size_t n) {
+  if (!src) return {};
+  return adi::text::wstring_to_utf8(src, n);
 }
 
-inline std::string wide_to_utf8(const wchar_t* src, int n) {
-  std::string out;
-  if (!src) return out;
-  out.reserve(static_cast<size_t>(n));
-  for (int i = 0; i < n; ++i) {
-    append_utf8(out, static_cast<uint32_t>(src[i]));
-  }
-  return out;
-}
-
-inline std::vector<uint32_t> utf8_to_codepoints(const char* src, int n) {
-  std::vector<uint32_t> out;
-  if (!src) return out;
-  int i = 0;
-  while (i < n) {
-    const auto c = static_cast<unsigned char>(src[i]);
-    uint32_t cp = 0;
-    int extra = 0;
-    if (c < 0x80) {
-      cp = c;
-    } else if ((c & 0xe0u) == 0xc0u) {
-      cp = c & 0x1fu;
-      extra = 1;
-    } else if ((c & 0xf0u) == 0xe0u) {
-      cp = c & 0x0fu;
-      extra = 2;
-    } else if ((c & 0xf8u) == 0xf0u) {
-      cp = c & 0x07u;
-      extra = 3;
-    } else {
-      cp = 0xfffd;
-    }
-    ++i;
-    for (int k = 0; k < extra && i < n; ++k, ++i) {
-      cp = (cp << 6) | (static_cast<unsigned char>(src[i]) & 0x3fu);
-    }
-    out.push_back(cp);
-  }
-  return out;
+inline size_t clamped_int(int n, size_t fallback) {
+  return n < 0 ? fallback : static_cast<size_t>(n);
 }
 
 // Convert a Windows-style path to something open() accepts.
 inline std::string normalize(std::string p) {
-  if (p.rfind("\\\\?\\", 0) == 0) p.erase(0, 4);
-  if (p.rfind("\\\\?\\UNC\\", 0) == 0) {
+  if (p.rfind(R"(\\?\UNC\)", 0) == 0) {
     p.erase(0, 8);
     if (!p.empty()) p.insert(0, "//");
+  } else if (p.rfind(R"(\\?\)", 0) == 0) {
+    p.erase(0, 4);
   }
   std::replace(p.begin(), p.end(), '\\', '/');
   return p;
@@ -132,7 +82,7 @@ inline std::string normalize(std::string p) {
 inline std::string narrow_path(const char* p) { return normalize(p ? std::string(p) : std::string()); }
 inline std::string narrow_path(const wchar_t* p) {
   if (!p) return {};
-  return normalize(wide_to_utf8(p, static_cast<int>(std::wcslen(p))));
+  return normalize(wide_to_utf8(p, std::wcslen(p)));
 }
 
 }  // namespace win32_shim_detail
@@ -179,7 +129,13 @@ inline BOOL WriteFile(HANDLE h, const void* buf, DWORD n, DWORD* wrote, void*) {
 }
 
 inline BOOL SetFilePointerEx(HANDLE h, LARGE_INTEGER distance, LARGE_INTEGER* new_pos, DWORD) {
-  const off_t r = ::lseek(win32_shim_detail::fd_of(h), static_cast<off_t>(distance.QuadPart), SEEK_SET);
+  if (distance.QuadPart < 0 ||
+      static_cast<uint64_t>(distance.QuadPart) >
+      static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+    return 0;
+  }
+  const off_t r = ::lseek(win32_shim_detail::fd_of(h), static_cast<off_t>(distance.QuadPart),
+                          SEEK_SET);
   if (r < 0) return 0;
   if (new_pos) new_pos->QuadPart = static_cast<LONGLONG>(r);
   return 1;
@@ -220,18 +176,32 @@ inline void* GetProcAddress(HMODULE, const char*) { return nullptr; }
 
 inline int WideCharToMultiByte(DWORD, DWORD, const wchar_t* src, int src_n, char* dst,
                                int dst_n, const char*, int*) {
-  const std::string out = win32_shim_detail::wide_to_utf8(src, src_n);
-  if (!dst) return static_cast<int>(out.size());
-  const int n = std::min<int>(dst_n, static_cast<int>(out.size()));
-  if (n > 0) std::memcpy(dst, out.data(), static_cast<size_t>(n));
-  return n;
+  if (!src) return 0;
+  const size_t n = src_n < 0 ? std::wcslen(src)
+                             : win32_shim_detail::clamped_int(src_n, 0);
+  const std::string out = adi::text::wstring_to_utf8(src, n);
+  if (!dst) {
+    return out.size() > static_cast<size_t>(INT_MAX) ? 0 : static_cast<int>(out.size());
+  }
+  if (dst_n <= 0 || out.size() > static_cast<size_t>(dst_n)) {
+    return 0;  // Win32: 0 means "buffer too small"
+  }
+  if (!out.empty()) std::memcpy(dst, out.data(), out.size());
+  return static_cast<int>(out.size());
 }
 
 inline int MultiByteToWideChar(DWORD, DWORD, const char* src, int src_n, wchar_t* dst,
                                int dst_n) {
-  const auto cps = win32_shim_detail::utf8_to_codepoints(src, src_n);
-  if (!dst) return static_cast<int>(cps.size());
-  const int n = std::min<int>(dst_n, static_cast<int>(cps.size()));
-  for (int i = 0; i < n; ++i) dst[i] = static_cast<wchar_t>(cps[i]);
-  return n;
+  if (!src) return 0;
+  const size_t n = src_n < 0 ? std::strlen(src)
+                             : win32_shim_detail::clamped_int(src_n, 0);
+  const std::wstring out = adi::text::utf8_to_wstring(src, n);
+  if (!dst) {
+    return out.size() > static_cast<size_t>(INT_MAX) ? 0 : static_cast<int>(out.size());
+  }
+  if (dst_n <= 0 || out.size() > static_cast<size_t>(dst_n)) {
+    return 0;
+  }
+  for (size_t i = 0; i < out.size(); ++i) dst[i] = out[i];
+  return static_cast<int>(out.size());
 }

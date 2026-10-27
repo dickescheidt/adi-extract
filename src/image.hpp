@@ -43,6 +43,15 @@ struct SectorMap {
     uint32_t sector_size = 512;
     uint64_t disk_sectors = 0;
     std::vector<Volume> volumes;
+
+    // Scan-based layout. When the decompressed block stream is a whole-disk
+    // coordinate space, every cluster lands at (stream offset + origin).
+    // The legacy layout derives offsets from one volume per index-chain run.
+    bool passthrough = false;
+    uint64_t origin = 0;
+    // Set when the stream already contains the disk's own MBR/GPT at LBA 0,
+    // in which case write_gpt() must not overwrite it.
+    bool native_table = false;
 };
 
 DiskGeometry inspect_image(const std::filesystem::path& img_path);
