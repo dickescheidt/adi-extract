@@ -388,6 +388,44 @@ static void test_lz4_decode_buffer() {
     std::filesystem::remove(path);
 }
 
+
+static void test_malformed_container_construction_does_not_leak() {
+#if defined(__linux__)
+    // Fuzzing exhausted the descriptor limit because a constructor that threw
+    // after opening the file never ran ~AdiFile. Both failure points matter.
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto short_path = dir / "adi-extract-safety-short.adi";
+    const auto bad_path = dir / "adi-extract-safety-bad-header.adi";
+    { std::ofstream f(short_path, std::ios::binary); f << "short"; }
+    { std::ofstream f(bad_path, std::ios::binary);
+      std::vector<char> junk(4096, 'Z');
+      f.write(junk.data(), static_cast<std::streamsize>(junk.size())); }
+    const auto count_fds = [] {
+        size_t n = 0;
+        for (const auto& entry : std::filesystem::directory_iterator("/proc/self/fd")) {
+            (void)entry;
+            ++n;
+        }
+        return n;
+    };
+    const size_t before = count_fds();
+    for (int i = 0; i < 600; ++i) {
+        for (const auto& path : {short_path, bad_path}) {
+            bool rejected = false;
+            try {
+                adi::AdiFile file(path);
+            } catch (const std::exception&) {
+                rejected = true;
+            }
+            assert(rejected && "malformed container was accepted");
+        }
+    }
+    assert(count_fds() <= before + 8 && "failed constructions leaked descriptors");
+    std::filesystem::remove(short_path);
+    std::filesystem::remove(bad_path);
+#endif
+}
+
 int main() {
     test_text_helpers();
     test_shim_conversions();
@@ -398,6 +436,7 @@ int main() {
     test_split_block_32k();
     test_container_fields_and_members();
     test_lz4_decode_buffer();
+    test_malformed_container_construction_does_not_leak();
     std::cout << "SAFETY TESTS PASSED\n";
     return 0;
 }

@@ -82,10 +82,20 @@ AdiFile::AdiFile(std::filesystem::path path,
     if (h == INVALID_HANDLE_VALUE) {
         throw std::runtime_error("cannot open " + path_.string());
     }
+    // parse_header(), parse_footer() and the image-set scan can throw. A
+    // half-constructed AdiFile never runs ~AdiFile, so release the handle here
+    // unless construction reaches the end (a fuzz target found this leak).
+    struct HandleGuard {
+        HANDLE handle;
+        ~HandleGuard() {
+            if (handle != INVALID_HANDLE_VALUE) {
+                CloseHandle(handle);
+            }
+        }
+    } guard{h};
     handle_ = h;
     LARGE_INTEGER sz{};
     if (!GetFileSizeEx(h, &sz)) {
-        CloseHandle(h);
         throw std::runtime_error("GetFileSizeEx failed");
     }
     file_size_ = static_cast<uint64_t>(sz.QuadPart);
@@ -103,6 +113,7 @@ AdiFile::AdiFile(std::filesystem::path path,
         }
     }
     image_set_ = ImageSet::from_paths(members);
+    guard.handle = INVALID_HANDLE_VALUE;
 }
 
 AdiFile::~AdiFile() {
