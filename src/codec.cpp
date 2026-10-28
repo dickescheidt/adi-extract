@@ -1,4 +1,6 @@
+#include "diagnostics.hpp"
 #include "codec.hpp"
+#include <iostream>
 
 #include <algorithm>
 #include <array>
@@ -701,12 +703,16 @@ ScanResult scan_payload(const AdiFile& file, const std::vector<BlockRec>& blocks
         }
         prev_end = b->end();
         if (n != b->usize) {
+            adi::debug_log() << "  warning: block at logical " << b->off
+                      << ": decoded size mismatch; skipped during discovery; verify output\n";
             ++r.short_blocks;
             continue;
         }
         if (b->crc != 0) {
             ++r.crc_checked;
             if (!block_crc_ok(*b, data, n)) {
+                adi::debug_log() << "  warning: block at logical " << b->off
+                          << ": checksum mismatch; skipped during discovery; verify output\n";
                 ++r.crc_bad;
                 ++r.odd_blocks;
                 continue;
@@ -714,6 +720,8 @@ ScanResult scan_payload(const AdiFile& file, const std::vector<BlockRec>& blocks
         }
         BlockLayout lay;
         if (!split_block(data, b->usize, cluster, &lay)) {
+            adi::debug_log() << "  warning: block at logical " << b->off
+                      << ": unrecognised layout; skipped during discovery; verify output\n";
             ++r.odd_blocks;
             continue;
         }
@@ -725,6 +733,8 @@ ScanResult scan_payload(const AdiFile& file, const std::vector<BlockRec>& blocks
             }
             const size_t src = size_t(lay.hdr) + size_t(slot) * lay.cluster;
             if (src > n || lay.cluster > n - src) {
+                adi::debug_log() << "  warning: truncated cluster data at logical " << b->off
+                          << "; discovery incomplete; verify output\n";
                 break;
             }
             sink.scan(data + src, lay.cluster, *b, u, lay.cluster);
@@ -749,6 +759,9 @@ ScanResult scan_payload(const AdiFile& file, const std::vector<BlockRec>& blocks
     r.out_bytes = st.out_pos();
     r.bad_blocks = st.bad_blocks();
     r.clean = st.ok() && r.bad_blocks == 0 && r.crc_bad == 0;
+    if (!r.clean)
+        adi::debug_log() << "  warning: payload scan incomplete or unverified; " << r.bad_blocks
+                  << " size failures, " << r.crc_bad << " checksum failures; verify output\n";
     if (!st.ok()) {
         r.error = st.error();
         r.error_in_pos = st.error_in_pos();

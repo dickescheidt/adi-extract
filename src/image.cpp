@@ -1,3 +1,4 @@
+#include "diagnostics.hpp"
 #include "image.hpp"
 
 #include <algorithm>
@@ -280,11 +281,21 @@ void write_gpt(SparseImage& img, const SectorMap& map) {
     mbr[511] = 0xAA;
     img.write_at(0, mbr.data(), mbr.size());
 
+    if (map.volumes.size() > 128)
+        adi::debug_log() << "  warning: GPT has only 128 entries; excess volumes omitted from partition "
+                     "table; verify output\n";
     std::vector<uint8_t> ents(size_t(128) * 128, 0);
     uint32_t n = 0;
     for (size_t i = 0; i < map.volumes.size() && n < 128; ++i) {
         const Volume& v = map.volumes[i];
+        if (std::all_of(std::begin(v.type_guid), std::end(v.type_guid),
+                        [](uint8_t b) { return b == 0; }) ||
+            std::all_of(std::begin(v.unique_guid), std::end(v.unique_guid),
+                        [](uint8_t b) { return b == 0; }))
+            adi::debug_log() << "  warning: missing partition GUIDs; generated/inferred GPT metadata "
+                         "needs verification\n";
         if (!v.sectors) {
+            adi::debug_log() << "  warning: zero-sector volume omitted from GPT; verify output\n";
             continue;
         }
         const PartType t = part_type(v, i + 1 == map.volumes.size());
@@ -365,10 +376,14 @@ void probe_volume(const AdiFile& file, const std::vector<BlockRec>& blocks, Volu
     uint32_t cluster = 0;
     while ((b = st.next_chunk(&data, &n)) != nullptr) {
         if (n != b->usize || !block_crc_ok(*b, data, n)) {
+            adi::debug_log() << "  warning: block at logical " << b->off
+                      << ": size/checksum failure during discovery; skipped; verify output\n";
             continue;
         }
         BlockLayout lay;
         if (!split_block(data, b->usize, cluster, &lay)) {
+            adi::debug_log() << "  warning: block at logical " << b->off
+                      << ": unrecognised layout during volume probe; skipped; verify output\n";
             continue;
         }
         if (!cluster && !lay.all_present) {
@@ -427,11 +442,15 @@ BootScan scan_boot_sectors(const AdiFile& file, const std::vector<BlockRec>& blo
     std::vector<uint64_t> seen;
     while ((b = st.next_chunk(&data, &n)) != nullptr) {
         if (n != b->usize || !block_crc_ok(*b, data, n)) {
+            adi::debug_log() << "  warning: block at logical " << b->off
+                      << ": size/checksum failure during discovery; skipped; verify output\n";
             continue;
         }
         BlockLayout lay;
         if (!split_block(data, b->usize, 0, &lay) || lay.units == 0 ||
             lay.cluster < kSector) {
+            adi::debug_log() << "  warning: block at logical " << b->off
+                      << ": unrecognised/empty layout during discovery; skipped; verify output\n";
             continue;
         }
         uint32_t slot = 0;
@@ -442,6 +461,8 @@ BootScan scan_boot_sectors(const AdiFile& file, const std::vector<BlockRec>& blo
             const size_t src_off = size_t(lay.hdr) + size_t(slot) * lay.cluster;
             ++slot;
             if (src_off > n || lay.cluster > n - src_off) {
+                adi::debug_log() << "  warning: truncated cluster data at logical " << b->off
+                          << "; remaining clusters skipped; verify output\n";
                 break;
             }
             const uint8_t* src = data + src_off;
@@ -641,6 +662,8 @@ uint64_t reconstruct_image(const AdiFile& file, const std::vector<BlockRec>& blo
 
     uint64_t written = 0;
     uint64_t units = 0;
+    adi::debug_log() << "  warning: legacy reconstruction uses inferred geometry and placement and may "
+                 "generate GPT; verify output layout and filesystem\n";
     uint64_t odd_blocks = 0;
     uint64_t short_blocks = 0;
     uint64_t outside = 0;
@@ -648,10 +671,15 @@ uint64_t reconstruct_image(const AdiFile& file, const std::vector<BlockRec>& blo
     uint64_t crc_bad = 0;
     uint64_t next_note = 2ull << 30;
 
-    auto emit = [&](const BlockRec& b, const uint8_t* data, size_t n, uint64_t base,
-                    uint64_t limit, uint32_t cluster_hint) {
+    auto emit = [&](const BlockRec &b, const uint8_t *data, size_t n, uint64_t base, uint64_t limit,
+                    uint32_t cluster_hint) {
+        if (b.crc == 0)
+            adi::debug_log() << "  warning: block at logical " << b.off
+                      << ": no decoded checksum; contents need verification\n";
         if (n != b.usize) {
             ++short_blocks;
+            adi::debug_log() << "  warning: block at logical " << b.off
+                      << ": decoded size mismatch; skipped; verify output\n";
             return;
         }
         if (b.crc != 0) {
@@ -667,6 +695,8 @@ uint64_t reconstruct_image(const AdiFile& file, const std::vector<BlockRec>& blo
         BlockLayout lay;
         if (!split_block(data, b.usize, cluster_hint, &lay)) {
             ++odd_blocks;
+            adi::debug_log() << "  warning: block at logical " << b.off
+                      << ": unrecognised layout; skipped; verify output\n";
             return;
         }
         uint32_t slot = 0;
@@ -686,12 +716,16 @@ uint64_t reconstruct_image(const AdiFile& file, const std::vector<BlockRec>& blo
             const size_t src_off = size_t(lay.hdr) + size_t(slot) * lay.cluster;
             ++slot;
             if (src_off > n || lay.cluster > n - src_off) {
+                adi::debug_log() << "  warning: truncated cluster data at logical " << b.off
+                          << "; remaining clusters skipped; verify output\n";
                 break;
             }
             const uint8_t* src = data + src_off;
             const uint64_t dst = base + uint64_t(u) * lay.cluster;
             if (dst + lay.cluster > limit) {
                 ++outside;
+                adi::debug_log() << "  warning: block at logical " << b.off
+                          << ": cluster exceeds volume boundary; skipped; verify output\n";
                 continue;
             }
             if (run_len && run_dst + run_len == dst && run_src + run_len == src) {
@@ -728,11 +762,11 @@ uint64_t reconstruct_image(const AdiFile& file, const std::vector<BlockRec>& blo
             }
         }
         if (!st.ok()) {
-            std::cout << "    decode stopped: " << st.error() << " at adi 0x" << std::hex
+            std::cerr << "  warning: decode stopped: " << st.error() << " at adi 0x" << std::hex
                       << st.error_in_pos() << std::dec << "\n";
         }
         if (st.bad_blocks()) {
-            std::cout << "    " << st.bad_blocks() << " blocks decoded to the wrong size\n";
+            std::cerr << "  warning: " << st.bad_blocks() << " blocks decoded to the wrong size\n";
         }
     } else {
         for (size_t vi = 0; vi < map.volumes.size(); ++vi) {
@@ -763,11 +797,12 @@ uint64_t reconstruct_image(const AdiFile& file, const std::vector<BlockRec>& blo
                 }
             }
             if (!st.ok()) {
-                std::cout << "    decode stopped: " << st.error() << " at adi 0x" << std::hex
+                std::cerr << "  warning: decode stopped: " << st.error() << " at adi 0x" << std::hex
                           << st.error_in_pos() << std::dec << "\n";
             }
             if (st.bad_blocks()) {
-                std::cout << "    " << st.bad_blocks() << " blocks decoded to the wrong size\n";
+                std::cerr << "  warning: " << st.bad_blocks()
+                          << " blocks decoded to the wrong size\n";
             }
         }
     }
@@ -836,6 +871,9 @@ uint64_t reconstruct_standard(const AdiFile& file, const StandardImage& std_img,
             if (std_img.have_compress && std_img.compress_mode > 1) {
                 throw std::runtime_error("unsupported compression mode (0x105)");
             }
+            if (std_img.have_compress && std_img.compress_mode == 0)
+                adi::debug_log() << "  warning: compression mode 0 but unequal stored/decoded sizes; "
+                             "attempting LZ4; verify output\n";
             if (!dec.decode_buffer(comp.data(), comp.size(), &data, &n)) {
                 std::cerr << "  warning: block at logical 0x" << std::hex << b.off
                           << std::dec << ": LZ4 decode failed: " << dec.error() << "\n";
@@ -863,6 +901,8 @@ uint64_t reconstruct_standard(const AdiFile& file, const StandardImage& std_img,
         const size_t cluster = b.cluster;
         const uint32_t cpb = b.clusters_per_block;
         if (n < bmp || !cluster || !cpb) {
+            adi::debug_log() << "  warning: block at logical " << b.off
+                      << ": invalid bitmap/geometry; skipped; verify output\n";
             ++odd;
             continue;
         }

@@ -51,3 +51,5 @@ echo "  legacy fallback: OK"
 echo "STANDARD TESTS PASSED"
 
 python3 tests/test_boundary.py ./adi-extract cpp
+
+python3 tests/test_warnings.py ./adi-extract cpp

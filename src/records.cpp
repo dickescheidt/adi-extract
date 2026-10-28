@@ -1,8 +1,10 @@
+#include "diagnostics.hpp"
 #include "records.hpp"
 #include "adi_file.hpp"
 #include "codec.hpp"
 
 #include <algorithm>
+#include <iostream>
 #include <cctype>
 #include <cstring>
 #include <iomanip>
@@ -343,6 +345,9 @@ std::vector<Set> find_sets(const AdiFile& file) {
         DataBlockIndex idx;
         if (parse_data_block_index(h, raw, &idx)) {
             data_blocks.push_back(std::move(idx));
+        } else {
+            adi::debug_log() << "  warning: malformed CRC-valid 0x202 at " << hexstr(h.off)
+                      << "; ignored; verify completeness\n";
         }
     }
     std::map<uint64_t, std::vector<size_t>> by_payload_end;
@@ -385,6 +390,8 @@ std::vector<Set> find_sets(const AdiFile& file) {
         }
         DirectoryIndex dir;
         if (!parse_directory_index(h, raw, &dir)) {
+            adi::debug_log() << "  warning: malformed CRC-valid 0x201 at " << hexstr(h.off)
+                      << "; ignored; verify completeness\n";
             continue;
         }
         const DirEntry* db_entry = nullptr;
@@ -396,10 +403,14 @@ std::vector<Set> find_sets(const AdiFile& file) {
             }
         }
         if (db_count != 1) {
+            adi::debug_log() << "  warning: volume index " << hexstr(h.off)
+                      << ": expected one 0x202 reference; skipped; verify output\n";
             continue;
         }
         const auto it = by_payload_end.find(db_entry->offset);
         if (it == by_payload_end.end()) {
+            adi::debug_log() << "  warning: volume index " << hexstr(h.off)
+                      << ": no matching 0x202; skipped; verify output\n";
             continue;
         }
         for (size_t mi : it->second) {
@@ -438,24 +449,44 @@ std::vector<Set> find_sets(const AdiFile& file) {
                     Metadata m;
                     if (parse_metadata(rh, rraw, &m)) {
                         set.metadata.push_back(std::move(m));
+                    } else {
+                        adi::debug_log() << "  warning: malformed 0x102 at " << hexstr(phys)
+                                  << "; ignored; verify metadata\n";
                     }
                 } else if (e.rec_type == kCompress) {
                     uint32_t mode = 0;
                     if (parse_mode(rh, rraw, &mode)) {
                         set.compress_mode = mode;
                         set.have_compress = true;
+                    } else {
+                        adi::debug_log() << "  warning: malformed 0x105 at " << hexstr(phys)
+                                  << "; mode unknown; verify output\n";
                     }
                 } else if (e.rec_type == kEncrypt) {
                     uint32_t mode = 0;
                     if (parse_mode(rh, rraw, &mode)) {
                         set.encrypt_mode = mode;
                         set.have_encrypt = true;
+                    } else {
+                        adi::debug_log() << "  warning: malformed 0x106 at " << hexstr(phys)
+                                  << "; mode unknown; verify output\n";
                     }
+                } else {
+                    adi::debug_log() << "  warning: unknown referenced record type " << hexstr(e.rec_type)
+                              << " at " << hexstr(phys) << "; ignored; output needs verification\n";
                 }
             }
             if (!ok || set.regions.empty()) {
+                adi::debug_log() << "  warning: volume index " << hexstr(h.off)
+                          << ": invalid, unreadable or checksum-invalid referenced record, or "
+                             "missing regions; candidate skipped; verify output\n";
                 continue;
             }
+            if ((!set.have_compress && have_global_compress) ||
+                (!set.have_encrypt && have_global_encrypt))
+                adi::debug_log()
+                    << "  warning: volume index " << hexstr(h.off)
+                    << ": mode taken from an unassociated global record; verify applicability\n";
             if (!set.have_compress && have_global_compress) {
                 set.compress_mode = global_compress;
                 set.have_compress = true;
@@ -473,6 +504,10 @@ std::vector<Set> find_sets(const AdiFile& file) {
                     ok = false;
                     break;
                 }
+                if (want != static_cast<size_t>(ref.entry_count) * kVdbSize || want % kVdbSize != 0)
+                    adi::debug_log() << "  warning: VDB reference at " << hexstr(phys)
+                              << ": truncated/misaligned table length; entries may be skipped; "
+                                 "verify completeness\n";
                 const auto table = file.read_vec(phys, want);
                 if (table.size() < want) {
                     ok = false;
@@ -483,8 +518,13 @@ std::vector<Set> find_sets(const AdiFile& file) {
                 }
             }
             if (!ok || set.entries.empty()) {
+                adi::debug_log() << "  warning: volume index " << hexstr(h.off)
+                          << ": invalid or empty VDB table; candidate skipped; verify output\n";
                 continue;
             }
+            if (set.entries.size() != dbi.entry_count)
+                adi::debug_log() << "  warning: VDB count differs from declared count/capacity; verify "
+                             "completeness\n";
             sets.push_back(std::move(set));
         }
     }
@@ -498,6 +538,10 @@ std::optional<StandardImage> parse_standard(const AdiFile& file, std::ostream& p
     if (sets.empty()) {
         return std::nullopt;
     }
+    adi::debug_log() << "  warning: output uses a reconstructed GPT/disk extent, not a verified copy of "
+                 "the original partition table; verify layout and filesystem before use\n";
+    adi::debug_log() << "  warning: standard-path filesystem type display is inferred from volume labels, "
+                 "not verified filesystem contents\n";
     StandardImage out;
     for (const Set& set : sets) {
         RecordSetInfo info;
@@ -505,11 +549,33 @@ std::optional<StandardImage> parse_standard(const AdiFile& file, std::ostream& p
         info.data_block_index_off = set.data_block_off;
         info.delta = set.delta;
         info.entry_count = set.entry_count;
+        if ((set.have_compress && set.compress_mode > 1) ||
+            (set.have_encrypt && set.encrypt_mode != 0))
+            adi::debug_log() << "  warning: unsupported compression/encryption mode; extraction is not "
+                         "verified/supported for this set\n";
         const bool have_meta = !set.metadata.empty();
+        if (set.metadata.size() != 1)
+            adi::debug_log() << "  warning: metadata missing or ambiguous at volume index "
+                      << hexstr(set.volume_off)
+                      << "; using first or default LBA 0/512-byte sectors; verify placement\n";
+        if (have_meta &&
+            (set.metadata[0].bytes_per_sector < 512 || set.metadata[0].bytes_per_sector > 4096))
+            adi::debug_log() << "  warning: invalid metadata sector size; assuming 512 bytes; verify "
+                         "placement\n";
+        if (!set.have_compress || !set.have_encrypt)
+            adi::debug_log() << "  warning: missing compression/encryption mode; assuming LZ4 for "
+                         "compressed blocks and no encryption; verify output\n";
+        if ((out.have_compress && set.have_compress && out.compress_mode != set.compress_mode) ||
+            (out.have_encrypt && set.have_encrypt && out.encrypt_mode != set.encrypt_mode))
+            adi::debug_log() << "  warning: conflicting volume modes; last mode retained; output needs "
+                         "verification\n";
         const uint64_t bps = have_meta && set.metadata[0].bytes_per_sector >= 512 &&
                                      set.metadata[0].bytes_per_sector <= 4096
                                  ? set.metadata[0].bytes_per_sector
                                  : 512;
+        if (bps != 512)
+            adi::debug_log() << "  warning: non-512-byte metadata sectors with 512-byte output GPT "
+                         "addressing; layout needs further verification\n";
         const uint64_t part_start =
             have_meta ? set.metadata[0].partition_start_sector : 0;
         const uint64_t part_sectors =
@@ -521,6 +587,9 @@ std::optional<StandardImage> parse_standard(const AdiFile& file, std::ostream& p
         for (const Region& r : set.regions) {
             region_end = std::max(region_end, r.block_begin_sector + r.total_sectors);
         }
+        if (part_sectors < region_end)
+            adi::debug_log() << "  warning: partition length absent/shorter than region extent; expanding "
+                         "from region geometry; verify partition bounds\n";
         const uint64_t sectors =
             std::max<uint64_t>({part_sectors, region_end, 1});
         const uint32_t cluster = set.regions.empty()
@@ -539,6 +608,12 @@ std::optional<StandardImage> parse_standard(const AdiFile& file, std::ostream& p
 
         std::map<uint32_t, Region> region_map;
         for (const Region& r : set.regions) {
+            if (region_map.count(r.reg_no))
+                adi::debug_log() << "  warning: duplicate region " << r.reg_no
+                          << "; last geometry retained; verify output\n";
+            if (r.bytes_per_sector != bps)
+                adi::debug_log()
+                    << "  warning: region and metadata sector sizes differ; verify placement\n";
             region_map[r.reg_no] = r;
             std::ostringstream o;
             o << "region " << r.reg_no << ": LBA " << r.block_begin_sector << " + "
@@ -572,6 +647,12 @@ std::optional<StandardImage> parse_standard(const AdiFile& file, std::ostream& p
             std::copy(set.metadata[0].unique_guid, set.metadata[0].unique_guid + 16,
                       vol.unique_guid);
         }
+        if (std::all_of(std::begin(vol.type_guid), std::end(vol.type_guid),
+                        [](uint8_t b) { return b == 0; }) ||
+            std::all_of(std::begin(vol.unique_guid), std::end(vol.unique_guid),
+                        [](uint8_t b) { return b == 0; }))
+            adi::debug_log() << "  warning: missing partition GUIDs; GPT uses a label-inferred type "
+                         "and/or generated identity; verify partition metadata\n";
         if (set.have_compress) {
             out.have_compress = true;
             out.compress_mode = set.compress_mode;
@@ -583,6 +664,10 @@ std::optional<StandardImage> parse_standard(const AdiFile& file, std::ostream& p
         for (const VdbEntry& e : set.entries) {
             const auto it = region_map.find(e.reg_no);
             if (it == region_map.end() || e.old_size == 0 || e.new_size == 0) {
+                adi::debug_log()
+                    << "  warning: VDB entry at logical " << hexstr(e.img_offset) << ", region "
+                    << e.reg_no
+                    << ": missing region or invalid sizes; skipped; output needs verification\n";
                 ++out.skipped_regions;
                 continue;
             }
@@ -608,6 +693,11 @@ std::optional<StandardImage> parse_standard(const AdiFile& file, std::ostream& p
         }
         out.volumes.push_back(std::move(vol));
     }
+    const auto unchecked = std::count_if(out.blocks.begin(), out.blocks.end(),
+                                         [](const StdBlock &b) { return b.crc == 0; });
+    if (unchecked)
+        adi::debug_log() << "  warning: " << unchecked
+                  << " VDB blocks have no decoded checksum; contents need verification\n";
     if (out.blocks.empty()) {
         return std::nullopt;
     }
@@ -615,6 +705,15 @@ std::optional<StandardImage> parse_standard(const AdiFile& file, std::ostream& p
               [](const StdBlock& a, const StdBlock& b) {
                   return a.base == b.base ? a.off < b.off : a.base < b.base;
               });
+    uint64_t covered_end = 0;
+    for (const auto &b : out.blocks) {
+        if (b.base < covered_end)
+            adi::debug_log() << "  warning: overlapping VDB block extents at output " << hexstr(b.base)
+                      << "; write precedence needs verification\n";
+        const uint64_t span = std::min<uint64_t>(
+            b.region_remaining, static_cast<uint64_t>(b.clusters_per_block) * b.cluster);
+        covered_end = std::max(covered_end, b.base + span);
+    }
     uint64_t end = 0;
     for (const auto& v : out.volumes) {
         end = std::max(end, v.lba + v.sectors);

@@ -1,3 +1,4 @@
+#include "diagnostics.hpp"
 #include "adi_file.hpp"
 #include "codec.hpp"
 #include "extract.hpp"
@@ -25,6 +26,7 @@ void usage() {
               << "  adi-extract reconstruct <file.adi> <disk.img> [max_bytes]\n"
               << "  adi-extract verify      <disk.img>\n"
               << "  adi-extract extract     <file.adi> <outdir>\n\n"
+              << "--debug enables extended format-audit diagnostics on stderr.\n"
               << "Sizes accept suffixes: 512M, 4G\n"
               << "Split image sets: set ADI_EXTRACT_MEMBERS to a colon-separated\n"
               << "list of additional .adi member files.\n";
@@ -169,6 +171,20 @@ void write_scan_report(const adi::ScanResult& r, const std::vector<adi::BlockRec
 }  // namespace
 
 int main(int argc, char** argv) {
+    int kept = 1;
+    bool options = true;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (options && arg == "--") {
+            options = false;
+        } else if (options && arg == "--debug") {
+            adi::debug_diagnostics = true;
+        } else {
+            argv[kept++] = argv[i];
+        }
+    }
+    argc = kept;
+    argv[argc] = nullptr;
     if (argc < 3) {
         usage();
         return 2;
@@ -177,6 +193,8 @@ int main(int argc, char** argv) {
     try {
         const std::string cache = argc > 2 ? std::string(argv[2]) + ".index" : std::string();
         if (cmd == "info") {
+            adi::debug_log() << "warning: info does not verify all decoded block contents/checksums; use "
+                         "extraction diagnostics and independent filesystem checks\n";
             adi::AdiFile file(argv[2], adi::extra_member_paths("ADI_EXTRACT_MEMBERS"));
             file.print_info();
             if (std::getenv("ADI_EXTRACT_LEGACY_ONLY") == nullptr) {
@@ -186,6 +204,8 @@ int main(int argc, char** argv) {
                 }
             }
             std::cout << "\nno standard record sets; using legacy signature scan\n";
+            adi::debug_log() << "warning: no standard record sets; using legacy signature scan; inferred "
+                         "geometry and placement need verification\n";
             auto blocks = adi::block_index(file, cache, std::cout);
             write_index_summary(std::cout, blocks);
             return 0;
@@ -268,6 +288,8 @@ int main(int argc, char** argv) {
                 }
                 if (!standard) {
                     std::cout << "no standard record sets; using legacy signature scan\n";
+                    adi::debug_log() << "warning: no standard record sets; using legacy signature scan; "
+                                 "inferred geometry and placement need verification\n";
                     auto blocks = adi::block_index(file, cache, std::cout);
                     auto map = adi::discover_map(file, blocks, outdir / "map.csv");
                     std::cout << "map: " << map.source << "\ndisk " << map.disk_sectors

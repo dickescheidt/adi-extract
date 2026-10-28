@@ -76,6 +76,37 @@ blocks, including a partial final cluster, are supported; padded blocks are
 clipped to the region boundary. Other decoded geometry mismatches stop extraction
 with an error instead of silently omitting the block.
 
+## Debug diagnostics and verification
+
+Use `--debug` to enable extended format-audit diagnostics on **stderr**:
+
+```bash
+adi-extract --debug info backup.adi
+adi-extract --debug reconstruct backup.adi disk.img 2> debug.log
+```
+
+The flag can appear before or after the command. Use `--` to end option parsing
+if a filename is literally `--debug`. Existing corruption/skip warnings and fatal
+errors remain visible without the flag. Debug mode changes diagnostics only,
+not the recovered bytes or exit status.
+
+Extended diagnostics cover unknown referenced records, rejected record-set
+candidates, missing or ambiguous metadata/modes, absent/unverified checksums,
+image-set gaps/overlaps, and inferred geometry or partition metadata. They also
+explain that `info` does not decode and verify all payload blocks. Correctly
+bounded partial final blocks are supported, not a geometry warning.
+
+A zero exit status is not proof of a complete or exact restore. Review recovery
+warnings; do not use partial output left by a failed command. This is a
+reverse-engineered format: diagnostics cover detected uncertainty, not unknown
+semantics the parser cannot recognize. Arbitrary signature-like bytes in
+compressed payloads are not treated as records, so rejected scan candidates
+alone do not trigger diagnostics.
+
+Validate the recovered layout and filesystem independently before restoring
+valuable media. Decoded block checksums do not verify destination placement or
+prove that a reconstructed GPT is identical to the original partition table.
+
 ## Tests
 
 ```bash

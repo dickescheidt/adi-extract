@@ -1,3 +1,4 @@
+#include "diagnostics.hpp"
 #include "image_set.hpp"
 #include "codec.hpp"
 
@@ -5,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <iostream>
 
 namespace adi {
 namespace {
@@ -46,7 +48,8 @@ ContainerFields parse_container_fields(const std::filesystem::path& path) {
         in.read(reinterpret_cast<char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
         std::fill(hdr.begin() + 8, hdr.begin() + 12, 0);
         f.header_crc_valid = br_crc32(hdr.data(), hdr.size()) == f.header_checksum;
-        f.name = utf16le_z(hdr.data() + 0x44, hdr.size() > 0x44 ? hdr.size() - 0x44 : 0);
+        if (hdr.size() > 0x44)
+            f.name = utf16le_z(hdr.data() + 0x44, hdr.size() - 0x44);
     }
 
     uint8_t tail16[16]{};
@@ -87,6 +90,15 @@ ImageSet ImageSet::from_paths(const std::vector<std::filesystem::path>& paths) {
     }
     for (const auto& p : paths) {
         const ContainerFields f = parse_container_fields(p);
+        if (!f.header_crc_valid || !f.tail_crc_valid)
+            adi::debug_log()
+                << "  warning: " << p.string()
+                << ": BIFH/BIFT checksum unverified/mismatched; metadata needs verification\n";
+        if (!f.has_image_set || f.data_length_in_set == 0 ||
+            f.data_length_in_set > f.file_size - std::min(f.file_size, f.header_size + f.tail_size))
+            adi::debug_log() << "  warning: " << p.string()
+                      << ": absent/invalid image-set length; using physical payload bounds; verify "
+                         "member mapping\n";
         const uint64_t payload =
             f.file_size > f.header_size + f.tail_size
                 ? f.file_size - f.header_size - f.tail_size
@@ -114,6 +126,13 @@ ImageSet ImageSet::from_paths(const std::vector<std::filesystem::path>& paths) {
               [](const ImageSetMemberInfo& a, const ImageSetMemberInfo& b) {
                   return a.logical_start < b.logical_start;
               });
+    for (size_t i = 1; i < out.members_.size(); ++i) {
+        const auto &a = out.members_[i - 1];
+        const auto &b = out.members_[i];
+        if (a.logical_start + a.data_length != b.logical_start)
+            adi::debug_log() << "  warning: image-set members have a gap or overlap before "
+                      << b.path.string() << "; first covering member used; verify mapping\n";
+    }
     return out;
 }
 
