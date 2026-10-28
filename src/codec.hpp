@@ -2,6 +2,7 @@
 
 #include "adi_file.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <iosfwd>
 #include <string>
@@ -26,12 +27,30 @@ struct BlockLayout {
     uint32_t hdr = 0;
     uint32_t cluster = 0;
     uint32_t units = 0;
+    // usize == 1 + kRegion: the bitmap is a single "all present" marker byte,
+    // not a real 1-byte bitmap. A genuine 1-byte bitmap (32 KiB clusters)
+    // must still be read bit by bit.
+    bool all_present = false;
 };
 
 bool split_block(const uint8_t* p, uint32_t usize, uint32_t cluster_hint, BlockLayout* out);
 
+/// AOMEI's Encrypt.dll!BRCrc32: CRC32C/Castagnoli, zero seed, final inversion.
+/// BlockRec::crc stores it over the *decoded* `usize` bytes of a block.
+uint32_t br_crc32(const uint8_t* p, size_t n);
+
+inline bool block_crc_ok(const BlockRec& b, const uint8_t* p, size_t n) {
+    // A zero field means no checksum was written (our fixtures and some
+    // images); we cannot distinguish that from a real zero CRC.
+    return b.crc == 0 || br_crc32(p, n) == b.crc;
+}
+
 inline bool unit_present(const uint8_t* p, const BlockLayout& lay, uint32_t u) {
-    return lay.hdr == 1 || (p[u >> 3] & (1u << (u & 7))) != 0;
+    if (lay.all_present) {
+        return true;
+    }
+    const uint32_t idx = u >> 3;
+    return idx < lay.hdr && (p[idx] & (1u << (u & 7))) != 0;
 }
 
 inline uint64_t region_offset(uint32_t region) {
@@ -127,6 +146,8 @@ struct ScanResult {
     uint64_t bad_blocks = 0;
     uint64_t short_blocks = 0;
     uint64_t odd_blocks = 0;
+    uint64_t crc_checked = 0;
+    uint64_t crc_bad = 0;
     uint64_t gaps = 0;
     bool clean = false;
     std::string error;

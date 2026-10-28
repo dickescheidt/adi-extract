@@ -18,4 +18,34 @@ reconstructed GPT) that can be mounted, carved or converted with `qemu-img`.
 
 Unofficial tool, not affiliated with AOMEI. Use at your own risk.
 
+## Format handling notes
+
+The 0x20-byte block-index records found by the payload signature scan are VDB
+index entries read 12 bytes late; their region/stream fields describe the
+**next** block. `resolve_regions()` therefore applies one global one-record
+shift. Chain gaps (normal metadata between block runs) do not reset region
+numbering — an earlier version invented a "free" region number at each gap and
+produced large bogus backward jumps. The on-disk `.index` cache includes a
+format version and is regenerated automatically when the parser changes.
+
+Each entry's `Crc32` is AOMEI's `BRCrc32`: CRC32C/Castagnoli, zero seed, final
+inversion, checked over the **decoded** block bytes. `reconstruct` and `scan`
+verify it and skip (with a warning) any block that fails; `info` reports how
+many entries carry a checksum, and `scan`'s report lists checked/bad counts.
+Entries with a zero checksum field are treated as "no checksum".
+
+Decoded blocks are a used-sector bitmap followed by only the present clusters.
+Cluster sizes from 512 B to 64 KiB are recognised, including the 32 KiB
+clusters used by sparse NTFS regions. `usize == 1 + 256 KiB` is a distinct
+"all clusters present" shorthand, not a real one-byte bitmap.
+
+## Tests
+
+```bash
+make test
+```
+
+Runs the four-partition/sparse-write regression, the VDB checksum and 32 KiB
+cluster regressions, and the ASan/UBSan safety suite.
+
 Licensed under the MIT License. See LICENSE.

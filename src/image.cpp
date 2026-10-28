@@ -340,17 +340,20 @@ void probe_volume(const AdiFile& file, const std::vector<BlockRec>& blocks, Volu
     size_t n = 0;
     uint32_t cluster = 0;
     while ((b = st.next_chunk(&data, &n)) != nullptr) {
-        if (n != b->usize) {
+        if (n != b->usize || !block_crc_ok(*b, data, n)) {
             continue;
         }
         BlockLayout lay;
         if (!split_block(data, b->usize, cluster, &lay)) {
             continue;
         }
-        if (!cluster && lay.hdr != 1) {
+        if (!cluster && !lay.all_present) {
             cluster = lay.cluster;
         }
         if (b->region != 0 || lay.units == 0 || !unit_present(data, lay, 0)) {
+            continue;
+        }
+        if (size_t(lay.hdr) > n || lay.cluster > n - lay.hdr) {
             continue;
         }
         BootSector bs;
@@ -399,7 +402,7 @@ BootScan scan_boot_sectors(const AdiFile& file, const std::vector<BlockRec>& blo
     size_t n = 0;
     std::vector<uint64_t> seen;
     while ((b = st.next_chunk(&data, &n)) != nullptr) {
-        if (n != b->usize) {
+        if (n != b->usize || !block_crc_ok(*b, data, n)) {
             continue;
         }
         BlockLayout lay;
@@ -412,8 +415,12 @@ BootScan scan_boot_sectors(const AdiFile& file, const std::vector<BlockRec>& blo
             if (!unit_present(data, lay, u)) {
                 continue;
             }
-            const uint8_t* src = data + lay.hdr + size_t(slot) * lay.cluster;
+            const size_t src_off = size_t(lay.hdr) + size_t(slot) * lay.cluster;
             ++slot;
+            if (src_off > n || lay.cluster > n - src_off) {
+                break;
+            }
+            const uint8_t* src = data + src_off;
             const uint64_t stream_off = region_offset(b->region) + uint64_t(u) * lay.cluster;
             if (b->region == 0 && u == 0 && src[kSector - 2] == 0x55 &&
                 src[kSector - 1] == 0xAA &&
@@ -613,6 +620,8 @@ uint64_t reconstruct_image(const AdiFile& file, const std::vector<BlockRec>& blo
     uint64_t odd_blocks = 0;
     uint64_t short_blocks = 0;
     uint64_t outside = 0;
+    uint64_t crc_checked = 0;
+    uint64_t crc_bad = 0;
     uint64_t next_note = 2ull << 30;
 
     auto emit = [&](const BlockRec& b, const uint8_t* data, size_t n, uint64_t base,
@@ -620,6 +629,16 @@ uint64_t reconstruct_image(const AdiFile& file, const std::vector<BlockRec>& blo
         if (n != b.usize) {
             ++short_blocks;
             return;
+        }
+        if (b.crc != 0) {
+            ++crc_checked;
+            if (!block_crc_ok(b, data, n)) {
+                ++crc_bad;
+                ++odd_blocks;
+                std::cerr << "  warning: block at adi 0x" << std::hex << b.off << std::dec
+                          << ": BRCrc32 mismatch, skipping\n";
+                return;
+            }
         }
         BlockLayout lay;
         if (!split_block(data, b.usize, cluster_hint, &lay)) {
@@ -640,9 +659,13 @@ uint64_t reconstruct_image(const AdiFile& file, const std::vector<BlockRec>& blo
             if (!unit_present(data, lay, u)) {
                 continue;
             }
-            const uint8_t* src = data + lay.hdr + size_t(slot) * lay.cluster;
-            const uint64_t dst = base + uint64_t(u) * lay.cluster;
+            const size_t src_off = size_t(lay.hdr) + size_t(slot) * lay.cluster;
             ++slot;
+            if (src_off > n || lay.cluster > n - src_off) {
+                break;
+            }
+            const uint8_t* src = data + src_off;
+            const uint64_t dst = base + uint64_t(u) * lay.cluster;
             if (dst + lay.cluster > limit) {
                 ++outside;
                 continue;
@@ -733,6 +756,9 @@ uint64_t reconstruct_image(const AdiFile& file, const std::vector<BlockRec>& blo
     }
     if (outside) {
         std::cout << ", " << outside << " units outside their volume";
+    }
+    if (crc_checked) {
+        std::cout << ", " << crc_checked << " BRCrc32 checked, " << crc_bad << " bad";
     }
     std::cout << "\n";
     return written;

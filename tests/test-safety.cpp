@@ -9,6 +9,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -193,11 +194,88 @@ static void test_runs_and_fixup() {
     }
 }
 
+// --- VDB cross-check regressions ------------------------------------------
+
+static void test_br_crc32() {
+    // AOMEI Encrypt.dll!BRCrc32 is CRC32C, not zlib's CRC32.
+    const uint8_t* empty = reinterpret_cast<const uint8_t*>("");
+    const uint8_t* digits = reinterpret_cast<const uint8_t*>("123456789");
+    const uint8_t* aomei = reinterpret_cast<const uint8_t*>("AOMEI");
+    assert(br_crc32(empty, 0) == 0xFFFFFFFFu);
+    assert(br_crc32(digits, 9) == 0xA71C05DFu);
+    assert(br_crc32(aomei, 5) == 0xEB000F91u);
+
+    std::vector<uint8_t> data = {'a', 'b', 'c'};
+    BlockRec b;
+    assert(block_crc_ok(b, data.data(), data.size()));  // crc == 0 -> unchecked
+    b.crc = br_crc32(data.data(), data.size());
+    assert(block_crc_ok(b, data.data(), data.size()));
+    b.crc ^= 1u;
+    assert(!block_crc_ok(b, data.data(), data.size()));
+}
+
+static void test_resolve_regions() {
+    // Six blocks in three chain runs with strictly increasing raw regions.
+    // A VDB entry's BlockNo describes the *next* block, so the correct result
+    // is one global one-record shift. Chain gaps must NOT reset a run head to
+    // the lowest free region number (that used to invent huge backward jumps).
+    std::vector<BlockRec> blocks(6);
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        blocks[i].off = 4096 * i + (i / 2) * 128;
+        blocks[i].csize = 4096;
+        blocks[i].region = 100000 + static_cast<uint32_t>(i);
+        blocks[i].stream = 0;
+    }
+    std::ostringstream progress;
+    resolve_regions(blocks, progress);
+    assert(blocks[0].region == 0);
+    for (size_t i = 1; i < blocks.size(); ++i) {
+        assert(blocks[i].region == 100000 + static_cast<uint32_t>(i - 1));
+        assert(blocks[i].region > blocks[i - 1].region);
+    }
+}
+
+static void test_split_block_32k() {
+    // A real sparse C: region uses 32 KiB clusters: a 1-byte bitmap followed
+    // by only the present clusters. hdr == 1 is NOT "all units present".
+    std::vector<uint8_t> buf(1 + 3 * 32768, 0x5A);
+    buf[0] = 0x49;  // bits 0, 3, 6
+    BlockLayout lay;
+    assert(split_block(buf.data(), static_cast<uint32_t>(buf.size()), 32768, &lay));
+    assert(lay.hdr == 1 && lay.cluster == 32768 && lay.units == 3);
+    assert(!lay.all_present);
+    assert(unit_present(buf.data(), lay, 0));
+    assert(!unit_present(buf.data(), lay, 1));
+    assert(!unit_present(buf.data(), lay, 2));
+    assert(unit_present(buf.data(), lay, 3));
+    assert(!unit_present(buf.data(), lay, 5));
+    assert(unit_present(buf.data(), lay, 6));
+    assert(!unit_present(buf.data(), lay, 7));
+    assert(!unit_present(buf.data(), lay, 8));  // beyond the bitmap
+
+    std::vector<uint8_t> one(1 + 32768, 0x00);
+    one[0] = 0x01;
+    assert(split_block(one.data(), static_cast<uint32_t>(one.size()), 32768, &lay));
+    assert(!lay.all_present && lay.units == 1);
+    assert(unit_present(one.data(), lay, 0));
+    assert(!unit_present(one.data(), lay, 1));
+
+    // usize == 1 + kRegion really is the "all present" shorthand.
+    std::vector<uint8_t> all(1 + kRegion, 0x11);
+    all[0] = 0x01;
+    assert(split_block(all.data(), static_cast<uint32_t>(all.size()), 0, &lay));
+    assert(lay.all_present && lay.units == kRegion / lay.cluster);
+    assert(unit_present(all.data(), lay, 7));
+}
+
 int main() {
     test_text_helpers();
     test_shim_conversions();
     test_mft_bounds();
     test_runs_and_fixup();
+    test_br_crc32();
+    test_resolve_regions();
+    test_split_block_32k();
     std::cout << "SAFETY TESTS PASSED\n";
     return 0;
 }

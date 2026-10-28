@@ -21,6 +21,7 @@ adi-extract: $(OBJ)
 
 test: adi-extract
 	./tests/test-multipart.sh
+	./tests/test-vdb.sh
 	./tests/test-safety.sh
 
 clean:

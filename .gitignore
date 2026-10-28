@@ -24,3 +24,7 @@ disk.img
 
 # generated dependency files (-MMD)
 *.d
+
+# Python fixture bytecode
+__pycache__/
+*.pyc

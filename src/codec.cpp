@@ -1,11 +1,11 @@
 #include "codec.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <fstream>
 #include <map>
 #include <ostream>
-#include <set>
 #include <utility>
 
 #ifndef NOMINMAX
@@ -22,6 +22,18 @@
 
 namespace adi {
 namespace {
+
+constexpr std::array<uint32_t, 256> make_br_table() {
+    std::array<uint32_t, 256> t{};
+    for (uint32_t i = 0; i < 256; ++i) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; ++k) {
+            c = (c & 1u) ? ((c >> 1) ^ 0x82F63B78u) : (c >> 1);
+        }
+        t[i] = c;
+    }
+    return t;
+}
 
 uint16_t rd16(const uint8_t* p) {
     return static_cast<uint16_t>(p[0] | (p[1] << 8));
@@ -91,6 +103,15 @@ bool plausible_rec(const uint8_t* p, uint64_t payload_span) {
 
 }  // namespace
 
+uint32_t br_crc32(const uint8_t* p, size_t n) {
+    static constexpr std::array<uint32_t, 256> kTable = make_br_table();
+    uint32_t crc = 0;
+    for (size_t i = 0; i < n; ++i) {
+        crc = (crc >> 8) ^ kTable[(crc ^ p[i]) & 0xFFu];
+    }
+    return ~crc;
+}
+
 std::vector<BlockRec> scan_block_index(const AdiFile& file, std::ostream& progress) {
     const uint64_t start = file.payload_offset();
     const uint64_t end = file.payload_end();
@@ -153,60 +174,48 @@ std::vector<BlockRec> scan_block_index(const AdiFile& file, std::ostream& progre
     return out;
 }
 
+// The 32-byte window found by signature is a real VDB index entry read 12
+// bytes late: its RegNo/BlockNo fields describe the *next* block, not the one
+// at `off`. So block i's region/stream is the stored value from record i-1,
+// and the very first block has no predecessor.
+//
+// The old implementation split the chain at gaps and then invented the
+// "lowest free" region number for every run head. On a real multi-volume
+// image those heads start at high block numbers, so inventing 0 made the
+// resolved regions jump backwards by gigabytes. That produced a bogus
+// out-of-order layout even for a perfectly ordered index. One global shift
+// has no such discontinuity.
 void resolve_regions(std::vector<BlockRec>& blocks, std::ostream& progress) {
-    std::vector<uint32_t> raw_stream(blocks.size());
-    std::vector<uint32_t> raw_region(blocks.size());
-    std::vector<size_t> run_of(blocks.size());
-    size_t run = 0;
+    const std::vector<uint32_t> raw_stream = [&] {
+        std::vector<uint32_t> v;
+        v.reserve(blocks.size());
+        for (const BlockRec& b : blocks) v.push_back(b.stream);
+        return v;
+    }();
+    const std::vector<uint32_t> raw_region = [&] {
+        std::vector<uint32_t> v;
+        v.reserve(blocks.size());
+        for (const BlockRec& b : blocks) v.push_back(b.region);
+        return v;
+    }();
+    size_t gaps = 0;
     for (size_t i = 0; i < blocks.size(); ++i) {
-        if (i && blocks[i - 1].end() != blocks[i].off) {
-            ++run;
-        }
-        run_of[i] = run;
-        raw_stream[i] = blocks[i].stream;
-        raw_region[i] = blocks[i].region;
-    }
-    std::map<std::pair<size_t, uint32_t>, std::vector<size_t>> groups;
-    for (size_t i = 0; i < blocks.size(); ++i) {
-        const bool opens_run = i == 0 || run_of[i - 1] != run_of[i];
-        blocks[i].stream = opens_run ? 0 : raw_stream[i - 1];
-        blocks[i].region = opens_run ? 0 : raw_region[i - 1];
-        groups[{run_of[i], blocks[i].stream}].push_back(i);
-    }
-    uint64_t dups = 0;
-    uint64_t odd_first = 0;
-    for (const auto& kv : groups) {
-        const size_t head = kv.second.front();
-        const bool opens_run = head == 0 || run_of[head - 1] != run_of[head];
-        std::set<uint32_t> taken;
-        for (size_t k = opens_run ? 1 : 0; k < kv.second.size(); ++k) {
-            if (!taken.insert(blocks[kv.second[k]].region).second) {
-                ++dups;
+        if (i == 0) {
+            blocks[0].stream = 0;
+            blocks[0].region = 0;
+        } else {
+            blocks[i].stream = raw_stream[i - 1];
+            blocks[i].region = raw_region[i - 1];
+            if (blocks[i - 1].end() != blocks[i].off) {
+                ++gaps;
             }
         }
-        if (!opens_run) {
-            continue;
-        }
-        uint32_t free_region = 0;
-        while (taken.count(free_region)) {
-            ++free_region;
-        }
-        if (free_region != 0) {
-            ++odd_first;
-        }
-        blocks[head].region = free_region;
     }
-    progress << "  regions resolved for " << groups.size() << " sub-streams";
-    if (dups) {
-        progress << ", " << dups << " duplicates";
-    }
-    if (odd_first) {
-        progress << ", " << odd_first << " sub-streams not starting at region 0";
-    }
-    progress << "\n";
+    progress << "  regions resolved by global one-record shift (" << blocks.size()
+             << " blocks, " << gaps << " chain gaps)\n";
 }
 
-constexpr uint64_t kCacheVersion = 3;
+constexpr uint64_t kCacheVersion = 4;
 constexpr uint64_t kCacheMagic = 0x3249444d54534cull + kCacheVersion;
 
 std::vector<BlockRec> block_index(const AdiFile& file, const std::string& cache,
@@ -530,26 +539,44 @@ bool lznt1_decompress(const uint8_t* src, size_t src_n, uint8_t* dst, size_t dst
 }
 
 bool split_block(const uint8_t* p, uint32_t usize, uint32_t cluster_hint, BlockLayout* out) {
+    // All callers have already verified that the buffer holds exactly `usize`
+    // decoded bytes, so `usize` is also the number of readable bytes here.
     if (usize == 1 + kRegion) {
         out->hdr = 1;
         out->cluster = cluster_hint ? cluster_hint : 512;
         out->units = kRegion / out->cluster;
+        out->all_present = true;
         return true;
     }
-    static const uint32_t kSizes[] = {512, 1024, 2048, 4096, 8192, 16384};
+    // Real images use 32 KiB clusters for sparse C: regions (2 MiB / 64 SPC).
+    // Cover the full power-of-two range so a 0x109 geometry of 32768 or 65536
+    // is not silently dropped as an "unrecognised header".
+    static const uint32_t kSizes[] = {512,   1024,  2048,  4096,
+                                      8192,  16384, 32768, 65536};
     for (const uint32_t cluster : kSizes) {
         if (cluster_hint && cluster != cluster_hint) {
             continue;
         }
-        const uint32_t hdr = kRegion / cluster / 8;
+        const uint32_t clusters_per_region = kRegion / cluster;
+        const uint32_t hdr = (clusters_per_region + 7) / 8;
+        if (hdr == 0 || hdr > usize) {
+            continue;
+        }
         uint32_t pop = 0;
         for (uint32_t i = 0; i < hdr; ++i) {
             pop += kPopcount[p[i]];
+        }
+        // Bits beyond clusters_per_region are padding; ignore them.
+        const uint32_t spare = std::min<uint32_t>(hdr * 8 - clusters_per_region, 7);
+        if (spare) {
+            const uint8_t last = static_cast<uint8_t>(p[hdr - 1] & (0xFFu >> spare));
+            pop = pop - kPopcount[p[hdr - 1]] + kPopcount[last];
         }
         if (usize == hdr + pop * cluster) {
             out->hdr = hdr;
             out->cluster = cluster;
             out->units = pop;
+            out->all_present = false;
             return true;
         }
     }
@@ -644,6 +671,14 @@ ScanResult scan_payload(const AdiFile& file, const std::vector<BlockRec>& blocks
             ++r.short_blocks;
             continue;
         }
+        if (b->crc != 0) {
+            ++r.crc_checked;
+            if (!block_crc_ok(*b, data, n)) {
+                ++r.crc_bad;
+                ++r.odd_blocks;
+                continue;
+            }
+        }
         BlockLayout lay;
         if (!split_block(data, b->usize, cluster, &lay)) {
             ++r.odd_blocks;
@@ -655,7 +690,11 @@ ScanResult scan_payload(const AdiFile& file, const std::vector<BlockRec>& blocks
             if (!unit_present(data, lay, u)) {
                 continue;
             }
-            sink.scan(data + lay.hdr + size_t(slot) * lay.cluster, lay.cluster, *b, u, lay.cluster);
+            const size_t src = size_t(lay.hdr) + size_t(slot) * lay.cluster;
+            if (src > n || lay.cluster > n - src) {
+                break;
+            }
+            sink.scan(data + src, lay.cluster, *b, u, lay.cluster);
             ++slot;
         }
         if (st.out_pos() >= next_note) {
@@ -676,7 +715,7 @@ ScanResult scan_payload(const AdiFile& file, const std::vector<BlockRec>& blocks
     }
     r.out_bytes = st.out_pos();
     r.bad_blocks = st.bad_blocks();
-    r.clean = st.ok() && r.bad_blocks == 0;
+    r.clean = st.ok() && r.bad_blocks == 0 && r.crc_bad == 0;
     if (!st.ok()) {
         r.error = st.error();
         r.error_in_pos = st.error_in_pos();

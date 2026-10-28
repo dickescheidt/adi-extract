@@ -93,9 +93,16 @@ void write_index_summary(std::ostream& out, const std::vector<adi::BlockRec>& bl
             ++gaps;
         }
     }
+    uint64_t crcs = 0;
+    for (const auto& b : blocks) {
+        if (b.crc != 0) {
+            ++crcs;
+        }
+    }
     out << "  first off: " << hex(blocks.front().off) << "\n"
         << "  last end:  " << hex(blocks.back().end()) << "\n"
         << "  covered:   " << covered << " compressed bytes\n"
+        << "  crcs:      " << crcs << " records carry a BRCrc32 checksum\n"
         << "  gaps:      " << gaps << " (metadata regions between block runs)\n";
     for (const auto& kv : stream_stats(blocks)) {
         out << "  stream " << kv.first << ": " << kv.second.blocks << " blocks, regions "
@@ -122,6 +129,8 @@ void write_scan_report(const adi::ScanResult& r, const std::vector<adi::BlockRec
     out << "  size mismatches: " << r.bad_blocks << "\n"
         << "  short blocks:    " << r.short_blocks << "\n"
         << "  odd headers:     " << r.odd_blocks << "\n"
+        << "  BRCrc32 checked: " << r.crc_checked << "\n"
+        << "  BRCrc32 bad:     " << r.crc_bad << "\n"
         << "  clean:           " << (r.clean ? "yes" : "no") << "\n";
     if (!r.error.empty()) {
         out << "\n[break]\n"
