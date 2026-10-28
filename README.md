@@ -152,6 +152,23 @@ For a longer reproducible placement run:
 python3 tests/test_properties.py ./adi-extract cpp --seeds 200
 ```
 
+### Coverage-guided fuzzing
+
+Optional libFuzzer harnesses harden the record parsers, the LZ4 decoder, the legacy
+chained decoder and the whole container path against malformed input. They are not
+part of the default test suite; see [`tests/fuzz/README.md`](tests/fuzz/README.md) for
+prerequisites, targets and the recorded campaign. Run them with:
+
+```bash
+sh tests/fuzz/run.sh 90
+```
+
+The 2026-10-28 campaign executed about 9.97 million cases under AddressSanitizer and
+UndefinedBehaviorSanitizer with no crash artifact. It also exposed a descriptor leak
+when a rejected container throws during construction; that is fixed and covered by a
+regression test. Fuzzing cannot validate the format itself and does not replace a real
+AOMEI restore comparison.
+
 ### Offset-only debug trace
 
 For the standard-record extraction path, `--debug` also emits `trace:` lines

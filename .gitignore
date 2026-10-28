@@ -28,3 +28,5 @@ disk.img
 # Python fixture bytecode
 __pycache__/
 *.pyc
+
+/target/
