@@ -271,7 +271,8 @@ bool Lz4Stream::decode_buffer(const uint8_t* src, size_t n, const uint8_t** out,
     produced_ = 0;
     error_.clear();
     in_.assign(std::max(n, kInBuf), 0);
-    std::memcpy(in_.data(), src, n);
+    if (n)
+        std::memcpy(in_.data(), src, n);
     in_base_ = 0;
     in_have_ = n;
     in_used_ = 0;

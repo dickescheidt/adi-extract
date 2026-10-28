@@ -367,6 +367,24 @@ static void test_lz4_decode_buffer() {
     const uint8_t comp2[] = {0x20, 'X', 'Y'};
     assert(dec.decode_buffer(comp2, sizeof(comp2), &out, &n));
     assert(n == 2 && std::memcmp(out, "XY", 2) == 0);
+    const uint8_t repeat[] = {0x1f, 'A', 1, 0, 0};
+    assert(dec.decode_buffer(repeat, sizeof(repeat), &out, &n));
+    assert(n == 20 && std::all_of(out, out + n, [](uint8_t b) { return b == 'A'; }));
+    for (const auto &bad :
+         std::vector<std::vector<uint8_t>>{{0xf0}, {0x10, 'X', 0}, {0, 0, 0}, {0x1f, 'A', 1, 0}}) {
+        assert(!dec.decode_buffer(bad.data(), bad.size(), &out, &n));
+    }
+    uint32_t state = 0x15a4e35u;
+    for (size_t test = 0; test < 4096; ++test) {
+        std::vector<uint8_t> input(test % 129);
+        for (auto &byte : input) {
+            state = state * 1664525u + 1013904223u;
+            byte = static_cast<uint8_t>(state >> 24);
+        }
+        (void)dec.decode_buffer(input.data(), input.size(), &out, &n);
+        assert(dec.decode_buffer(comp, sizeof(comp), &out, &n));
+        assert(n == 4 && std::memcmp(out, "ABCD", 4) == 0);
+    }
     std::filesystem::remove(path);
 }
 

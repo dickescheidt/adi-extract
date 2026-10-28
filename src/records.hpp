@@ -13,6 +13,8 @@ class AdiFile;
 /// One real 0x20-byte VDB entry with its exact output placement.
 struct StdBlock {
     uint64_t off = 0;  // ImgOffset — an image-set LOGICAL offset
+    uint32_t reg_no = 0;
+    uint64_t block_no = 0;
     uint32_t usize = 0;
     uint32_t csize = 0;
     uint32_t crc = 0;

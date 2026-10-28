@@ -678,6 +678,8 @@ std::optional<StandardImage> parse_standard(const AdiFile& file, std::ostream& p
                 bps;
             StdBlock b;
             b.off = e.img_offset;
+            b.reg_no = e.reg_no;
+            b.block_no = e.block_no;
             b.usize = e.old_size;
             b.csize = e.new_size;
             b.crc = e.crc;

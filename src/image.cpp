@@ -861,6 +861,10 @@ uint64_t reconstruct_standard(const AdiFile& file, const StandardImage& std_img,
     uint64_t crc_bad = 0;
     uint64_t odd = 0;
     for (const StdBlock& b : std_img.blocks) {
+        adi::debug_log() << "  trace: vdb region=" << b.reg_no << " block=" << b.block_no
+                         << " logical=0x" << std::hex << b.off << std::dec << " stored=" << b.csize
+                         << " expected=" << b.usize << " output_base=0x" << std::hex << b.base
+                         << std::dec << " region_remaining=" << b.region_remaining << "\n";
         const auto comp = file.read_logical_vec(b.off, b.csize);
         const uint8_t* data = nullptr;
         size_t n = 0;
@@ -897,6 +901,11 @@ uint64_t reconstruct_standard(const AdiFile& file, const StandardImage& std_img,
                 continue;
             }
         }
+        if (adi::debug_diagnostics) {
+            adi::debug_log() << "  trace: decoded logical=0x" << std::hex << b.off << std::dec
+                             << " bytes=" << n << " crc_actual=0x" << std::hex << br_crc32(data, n)
+                             << " crc_expected=0x" << b.crc << std::dec << "\n";
+        }
         const size_t bmp = b.bitmap_len;
         const size_t cluster = b.cluster;
         const uint32_t cpb = b.clusters_per_block;
@@ -905,6 +914,14 @@ uint64_t reconstruct_standard(const AdiFile& file, const StandardImage& std_img,
                       << ": invalid bitmap/geometry; skipped; verify output\n";
             ++odd;
             continue;
+        }
+        if (adi::debug_diagnostics) {
+            adi::debug_log() << "  trace: bitmap logical=0x" << std::hex << b.off << " bytes=";
+            for (size_t i = 0; i < bmp; ++i)
+                adi::debug_log() << std::setw(2) << std::setfill('0')
+                                 << static_cast<unsigned>(data[i]);
+            adi::debug_log() << std::setfill(' ') << std::dec << " clusters=" << cpb
+                             << " cluster_bytes=" << cluster << "\n";
         }
         size_t pop = 0;
         for (uint32_t u = 0; u < cpb; ++u) {
@@ -931,6 +948,9 @@ uint64_t reconstruct_standard(const AdiFile& file, const StandardImage& std_img,
         size_t run_len = 0;
         auto flush = [&]() {
             if (run_len) {
+                adi::debug_log() << "  trace: write logical=0x" << std::hex << b.off << std::dec
+                                 << " decoded_offset=" << (run_src - data) << " output=0x"
+                                 << std::hex << run_dst << std::dec << " bytes=" << run_len << "\n";
                 written += img.write_at(run_dst, run_src, run_len);
                 run_len = 0;
             }

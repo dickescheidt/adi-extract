@@ -156,6 +156,9 @@ void ImageSet::read(uint64_t logical, void* dst, size_t n) const {
             m->info.logical_start + m->info.data_length - cur, n - done);
         const uint64_t physical =
             m->info.header_size + (cur - m->info.logical_start);
+        adi::debug_log() << "  trace: read member=" << (m - state_.data()) << " logical=0x"
+                         << std::hex << cur << " physical=0x" << physical << std::dec
+                         << " bytes=" << available << "\n";
         m->file->clear();
         m->file->seekg(static_cast<std::streamoff>(physical));
         m->file->read(reinterpret_cast<char*>(out + done),
