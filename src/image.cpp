@@ -289,15 +289,39 @@ void write_gpt(SparseImage& img, const SectorMap& map) {
         }
         const PartType t = part_type(v, i + 1 == map.volumes.size());
         uint8_t* e = ents.data() + size_t(n) * 128;
-        std::memcpy(e, t.guid, 16);
-        std::memcpy(e + 16, t.guid, 16);
-        e[16] = uint8_t(0xA0 + n);
-        e[17] = uint8_t(0x51 + n);
+        const auto any = [](const uint8_t* g) {
+            for (int k = 0; k < 16; ++k) {
+                if (g[k]) return true;
+            }
+            return false;
+        };
+        const bool recovered_type = any(v.type_guid);
+        const bool recovered_unique = any(v.unique_guid);
+        const uint8_t* type = recovered_type ? v.type_guid : t.guid;
+        std::memcpy(e, type, 16);
+        std::memcpy(e + 16, type, 16);
+        if (recovered_unique) {
+            std::memcpy(e + 16, v.unique_guid, 16);
+        } else {
+            e[16] = uint8_t(0xA0 + n);
+            e[17] = uint8_t(0x51 + n);
+        }
         put64(e + 32, v.lba);
         put64(e + 40, v.lba + v.sectors - 1);
-        const std::string name = t.name;
-        for (size_t k = 0; k < name.size() && k < 35; ++k) {
-            e[56 + 2 * k] = uint8_t(name[k]);
+        if (v.part_name.empty()) {
+            const std::string name = t.name;
+            for (size_t k = 0; k < name.size() && k < 35; ++k) {
+                e[56 + 2 * k] = uint8_t(name[k]);
+            }
+        } else {
+            // GPT names are UTF-16LE, up to 36 code units. AOMEI labels are
+            // ASCII in practice; emit the low byte of each UTF-8 code unit.
+            size_t k = 0;
+            for (size_t j = 0; j < v.part_name.size() && k < 36; ++j, ++k) {
+                const uint8_t c = static_cast<uint8_t>(v.part_name[j]);
+                e[56 + 2 * k] = c < 0x80 ? c : '?';
+                e[57 + 2 * k] = 0;
+            }
         }
         ++n;
     }
@@ -759,6 +783,144 @@ uint64_t reconstruct_image(const AdiFile& file, const std::vector<BlockRec>& blo
     }
     if (crc_checked) {
         std::cout << ", " << crc_checked << " BRCrc32 checked, " << crc_bad << " bad";
+    }
+    std::cout << "\n";
+    return written;
+}
+
+uint64_t reconstruct_standard(const AdiFile& file, const StandardImage& std_img,
+                              const std::filesystem::path& out_img) {
+    if (std_img.have_encrypt && std_img.encrypt_mode != 0) {
+        throw std::runtime_error(
+            "encrypted images are not supported (0x106 mode != 0)");
+    }
+    SectorMap map;
+    map.source = "standard 0x201/0x202/0x109 records";
+    map.sector_size = kSector;
+    map.disk_sectors = std_img.disk_sectors;
+    for (const auto& v : std_img.volumes) {
+        Volume vol;
+        vol.first = 0;
+        vol.last = std_img.blocks.empty() ? 0 : std_img.blocks.size() - 1;
+        vol.cluster = v.cluster;
+        vol.lba = v.lba;
+        vol.sectors = v.sectors;
+        vol.fs = v.fs;
+        vol.label = v.label;
+        vol.part_name = v.part_name;
+        std::copy(v.type_guid, v.type_guid + 16, vol.type_guid);
+        std::copy(v.unique_guid, v.unique_guid + 16, vol.unique_guid);
+        map.volumes.push_back(std::move(vol));
+    }
+
+    SparseImage img(out_img);
+    const uint64_t limit = std_img.disk_sectors * map.sector_size;
+    img.set_size(limit);
+    write_gpt(img, map);
+
+    const std::vector<BlockRec> no_blocks;
+    Lz4Stream dec(file, no_blocks);
+    uint64_t written = 0;
+    uint64_t units = 0;
+    uint64_t crc_checked = 0;
+    uint64_t crc_bad = 0;
+    uint64_t odd = 0;
+    for (const StdBlock& b : std_img.blocks) {
+        const auto comp = file.read_logical_vec(b.off, b.csize);
+        const uint8_t* data = nullptr;
+        size_t n = 0;
+        if (b.csize == b.usize) {
+            data = comp.data();
+            n = comp.size();
+        } else {
+            if (std_img.have_compress && std_img.compress_mode > 1) {
+                throw std::runtime_error("unsupported compression mode (0x105)");
+            }
+            if (!dec.decode_buffer(comp.data(), comp.size(), &data, &n)) {
+                std::cerr << "  warning: block at logical 0x" << std::hex << b.off
+                          << std::dec << ": LZ4 decode failed: " << dec.error() << "\n";
+                ++odd;
+                continue;
+            }
+        }
+        if (n != b.usize) {
+            std::cerr << "  warning: block at logical 0x" << std::hex << b.off
+                      << std::dec << ": decoded " << n << " bytes, expected "
+                      << b.usize << "\n";
+            ++odd;
+            continue;
+        }
+        if (b.crc != 0) {
+            ++crc_checked;
+            if (br_crc32(data, n) != b.crc) {
+                ++crc_bad;
+                std::cerr << "  warning: block at logical 0x" << std::hex << b.off
+                          << std::dec << ": BRCrc32 mismatch, skipping\n";
+                continue;
+            }
+        }
+        const size_t bmp = b.bitmap_len;
+        const size_t cluster = b.cluster;
+        const uint32_t cpb = b.clusters_per_block;
+        if (n < bmp || !cluster || !cpb) {
+            ++odd;
+            continue;
+        }
+        size_t pop = 0;
+        for (uint32_t u = 0; u < cpb; ++u) {
+            if (u / 8 < bmp && (data[u / 8] & (1u << (u & 7)))) {
+                ++pop;
+            }
+        }
+        auto bytes_at = [&](uint32_t u) -> size_t {
+            const uint64_t offset = static_cast<uint64_t>(u) * cluster;
+            return offset < b.region_remaining
+                ? static_cast<size_t>(std::min<uint64_t>(cluster, b.region_remaining - offset)) : 0;
+        };
+        size_t bounded = bmp;
+        for (uint32_t u = 0; u < cpb; ++u) {
+            if (u / 8 < bmp && (data[u / 8] & (1u << (u & 7)))) bounded += bytes_at(u);
+        }
+        const bool padded = n == bmp + pop * cluster;
+        if (!b.region_remaining || (!padded && n != bounded)) {
+            throw std::runtime_error("decoded block size does not match 0x109 geometry at logical offset " + std::to_string(b.off));
+        }
+        size_t source = bmp;
+        uint64_t run_dst = 0;
+        const uint8_t* run_src = nullptr;
+        size_t run_len = 0;
+        auto flush = [&]() {
+            if (run_len) {
+                written += img.write_at(run_dst, run_src, run_len);
+                run_len = 0;
+            }
+        };
+        for (uint32_t u = 0; u < cpb; ++u) {
+            if (u / 8 >= bmp || !(data[u / 8] & (1u << (u & 7)))) {
+                continue;
+            }
+            const size_t len = bytes_at(u);
+            const size_t src = source;
+            source += padded ? cluster : len;
+            const uint64_t dst = b.base + static_cast<uint64_t>(u) * cluster;
+            if (!len) continue;
+            if (dst + len > limit) throw std::runtime_error("standard block exceeds output boundary");
+            if (run_len && run_dst + run_len == dst && run_src + run_len == data + src) {
+                run_len += len;
+            } else {
+                flush();
+                run_dst = dst;
+                run_src = data + src;
+                run_len = len;
+            }
+            ++units;
+        }
+        flush();
+    }
+    std::cout << "  " << units << " units placed, " << crc_checked
+              << " BRCrc32 checked, " << crc_bad << " bad";
+    if (odd) {
+        std::cout << ", " << odd << " odd blocks";
     }
     std::cout << "\n";
     return written;

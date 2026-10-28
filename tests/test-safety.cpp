@@ -5,8 +5,12 @@
 
 #include "../src/extract.cpp"
 
+#include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -268,6 +272,104 @@ static void test_split_block_32k() {
     assert(unit_present(all.data(), lay, 7));
 }
 
+// --- Standard records / image-set translation -----------------------------
+
+static void putbytes(std::vector<uint8_t>& b, size_t off, const void* p, size_t n) {
+    if (off + n > b.size()) {
+        b.resize(off + n, 0);
+    }
+    std::memcpy(b.data() + off, p, n);
+}
+
+static void test_container_fields_and_members() {
+    // A real-size BIFH/BIFT pair with DataOffInSet/DataLenInSet and valid
+    // BRCrc32 in both framing records.
+    const uint32_t head_size = 0x65c;
+    const uint32_t tail_size = 0x674;
+    const uint64_t payload = 0x800;
+    std::vector<uint8_t> image(head_size + payload + tail_size, 0);
+    std::memcpy(image.data(), "BIFH", 4);
+    std::vector<uint8_t> head(image.begin(), image.begin() + head_size);
+    put32(head.data() + 4, head_size);
+    head[8] = head[9] = head[10] = head[11] = 0;
+    put32(head.data() + 8, br_crc32(head.data(), head.size()));
+    std::copy(head.begin(), head.end(), image.begin());
+
+    std::vector<uint8_t> tail(tail_size, 0);
+    const uint64_t data_len = 0x500;
+    const uint64_t data_off = 0x1000;
+    putbytes(tail, 0x620, &data_len, 8);
+    putbytes(tail, 0x628, &data_off, 8);
+    put32(tail.data() + tail_size - 8, tail_size);
+    std::memcpy(tail.data() + tail_size - 4, "BIFT", 4);
+    std::fill(tail.begin() + tail_size - 12, tail.begin() + tail_size - 8, 0);
+    put32(tail.data() + tail_size - 12, br_crc32(tail.data(), tail.size()));
+    std::copy(tail.begin(), tail.end(), image.begin() + head_size + payload);
+
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto path = dir / "adi-extract-safety-member.adi";
+    { std::ofstream f(path, std::ios::binary);
+      f.write(reinterpret_cast<const char*>(image.data()),
+              static_cast<std::streamsize>(image.size())); }
+    const auto f = parse_container_fields(path);
+    assert(f.header_size == head_size && f.tail_size == tail_size);
+    assert(f.has_image_set);
+    assert(f.data_offset_in_set == data_off && f.data_length_in_set == data_len);
+    assert(f.header_crc_valid && f.tail_crc_valid);
+
+    // The physical read for a logical offset must add BIFH.size.
+    const auto set = ImageSet::from_paths({path});
+    assert(set.members().size() == 1);
+    const auto at = set.read_vec(data_off + 0x10, 8);
+    assert(at.size() == 8);
+    (void)at;
+    // An offset outside the member's logical range is an error, not a raw seek.
+    bool threw = false;
+    try {
+        (void)set.read_vec(data_off + data_len + 1, 4);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    assert(threw);
+    std::filesystem::remove(path);
+
+    setenv("ADI_EXTRACT_SAFETY_MEMBERS", "/tmp/a.adi:/tmp/b.adi", 1);
+    const auto parts = extra_member_paths("ADI_EXTRACT_SAFETY_MEMBERS");
+    assert(parts.size() == 2 && parts[0] == "/tmp/a.adi" && parts[1] == "/tmp/b.adi");
+    unsetenv("ADI_EXTRACT_SAFETY_MEMBERS");
+    assert(extra_member_paths("ADI_EXTRACT_SAFETY_MEMBERS").empty());
+}
+
+static void test_lz4_decode_buffer() {
+    // Token 0x40 = 4 literals, then the four bytes. decode_buffer must work
+    // with a fresh window and no backing block chain.
+    const uint8_t comp[] = {0x40, 'A', 'B', 'C', 'D'};
+    const std::vector<adi::BlockRec> none;
+    // No AdiFile is needed: decode_buffer never reads from the file. We still
+    // need an object, so reuse the temp container from the previous test.
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto path = dir / "adi-extract-safety-stub.adi";
+    std::vector<uint8_t> stub(0x40 + 64 + 16, 0);
+    std::memcpy(stub.data(), "BIFH", 4);
+    put32(stub.data() + 4, 0x40);
+    put32(stub.data() + 0x40 + 64 + 8, 16);
+    std::memcpy(stub.data() + 0x40 + 64 + 12, "BIFT", 4);
+    { std::ofstream f(path, std::ios::binary);
+      f.write(reinterpret_cast<const char*>(stub.data()),
+              static_cast<std::streamsize>(stub.size())); }
+    adi::AdiFile file(path);
+    adi::Lz4Stream dec(file, none);
+    const uint8_t* out = nullptr;
+    size_t n = 0;
+    assert(dec.decode_buffer(comp, sizeof(comp), &out, &n));
+    assert(n == 4 && std::memcmp(out, "ABCD", 4) == 0);
+    // A fresh call must not inherit the previous block's output.
+    const uint8_t comp2[] = {0x20, 'X', 'Y'};
+    assert(dec.decode_buffer(comp2, sizeof(comp2), &out, &n));
+    assert(n == 2 && std::memcmp(out, "XY", 2) == 0);
+    std::filesystem::remove(path);
+}
+
 int main() {
     test_text_helpers();
     test_shim_conversions();
@@ -276,6 +378,8 @@ int main() {
     test_br_crc32();
     test_resolve_regions();
     test_split_block_32k();
+    test_container_fields_and_members();
+    test_lz4_decode_buffer();
     std::cout << "SAFETY TESTS PASSED\n";
     return 0;
 }

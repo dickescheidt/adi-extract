@@ -39,6 +39,43 @@ Cluster sizes from 512 B to 64 KiB are recognised, including the 32 KiB
 clusters used by sparse NTFS regions. `usize == 1 + 256 KiB` is a distinct
 "all clusters present" shorthand, not a real one-byte bitmap.
 
+### Standard record path
+
+Real images contain a standard record stream: CRC-valid `0x201` volume indexes,
+`0x202` data-block indexes, `0x109` region geometry, `0x102` volume metadata
+and `0x105`/`0x106` compression/encryption modes. `info` and `reconstruct`
+discover those records first. A `0x201` directory entry pointing at the end of
+the VDB table is matched against the `0x202` header to derive a per-volume
+logical-to-physical delta; the delta resolves the region, metadata and mode
+records and the VDB table itself.
+
+With that path the block geometry and the partition's absolute start LBA, size,
+GPT type GUID, unique GUID and label are recovered from the records instead of
+being guessed from boot sectors, and the real 0x20-byte VDB entries are read
+directly. If no CRC-valid record set exists (synthetic or older images), the
+tool falls back to the signature-scan parser. Set `ADI_EXTRACT_LEGACY_ONLY=1`
+to force that fallback.
+
+`ImgOffset` in a VDB entry is a **logical image-set offset**, not a raw file
+offset. Reads use `physical = logical - DataOffInSet + BIFH.size`, with
+`DataOffInSet` / `DataLenInSet` read from BIFT `+0x628` / `+0x620`. Split
+backups need their extra members listed in `ADI_EXTRACT_MEMBERS` as a
+colon-separated list:
+
+```bash
+ADI_EXTRACT_MEMBERS="Backup1.adi:Backup2.adi" \
+  ./adi-extract reconstruct Backup.adi disk.img
+```
+
+`info` prints each member's logical range; a read outside every member fails
+rather than silently seeking to the wrong offset. Only compression mode 1
+(AOMEI LZ4) and direct blocks, with encryption mode 0, are supported.
+
+Standard-record blocks are bounded by their `0x109` region length. Short final
+blocks, including a partial final cluster, are supported; padded blocks are
+clipped to the region boundary. Other decoded geometry mismatches stop extraction
+with an error instead of silently omitting the block.
+
 ## Tests
 
 ```bash
@@ -46,6 +83,7 @@ make test
 ```
 
 Runs the four-partition/sparse-write regression, the VDB checksum and 32 KiB
-cluster regressions, and the ASan/UBSan safety suite.
+cluster regressions, the standard-record and split-image-set regressions, and
+the ASan/UBSan safety suite.
 
 Licensed under the MIT License. See LICENSE.

@@ -25,7 +25,9 @@ void usage() {
               << "  adi-extract reconstruct <file.adi> <disk.img> [max_bytes]\n"
               << "  adi-extract verify      <disk.img>\n"
               << "  adi-extract extract     <file.adi> <outdir>\n\n"
-              << "Sizes accept suffixes: 512M, 4G\n";
+              << "Sizes accept suffixes: 512M, 4G\n"
+              << "Split image sets: set ADI_EXTRACT_MEMBERS to a colon-separated\n"
+              << "list of additional .adi member files.\n";
 }
 
 uint64_t parse_size(const std::string& s) {
@@ -175,14 +177,21 @@ int main(int argc, char** argv) {
     try {
         const std::string cache = argc > 2 ? std::string(argv[2]) + ".index" : std::string();
         if (cmd == "info") {
-            adi::AdiFile file(argv[2]);
+            adi::AdiFile file(argv[2], adi::extra_member_paths("ADI_EXTRACT_MEMBERS"));
             file.print_info();
+            if (std::getenv("ADI_EXTRACT_LEGACY_ONLY") == nullptr) {
+                if (auto std_img = adi::parse_standard(file, std::cout)) {
+                    adi::print_standard_info(*std_img, std::cout);
+                    return 0;
+                }
+            }
+            std::cout << "\nno standard record sets; using legacy signature scan\n";
             auto blocks = adi::block_index(file, cache, std::cout);
             write_index_summary(std::cout, blocks);
             return 0;
         }
         if (cmd == "scan") {
-            adi::AdiFile file(argv[2]);
+            adi::AdiFile file(argv[2], adi::extra_member_paths("ADI_EXTRACT_MEMBERS"));
             const fs::path report = argc > 3 ? fs::path(argv[3]) : fs::path("scan.txt");
             const uint64_t max_out = argc > 4 ? parse_size(argv[4]) : 0;
             file.print_info();
@@ -226,7 +235,7 @@ int main(int argc, char** argv) {
                 usage();
                 return 2;
             }
-            adi::AdiFile file(argv[2]);
+            adi::AdiFile file(argv[2], adi::extra_member_paths("ADI_EXTRACT_MEMBERS"));
             const bool full = cmd == "extract";
             const fs::path outdir = full ? fs::path(argv[3]) : fs::path(argv[3]).parent_path();
             const fs::path img = full ? outdir / "disk.img" : fs::path(argv[3]);
@@ -240,23 +249,44 @@ int main(int argc, char** argv) {
                 std::cout << "reusing " << img.string() << "\n";
                 written = fs::file_size(img);
             } else {
-                auto blocks = adi::block_index(file, cache, std::cout);
-                auto map = adi::discover_map(file, blocks, outdir / "map.csv");
-                std::cout << "map: " << map.source << "\ndisk " << map.disk_sectors
-                          << " sectors (" << (map.disk_sectors / 2097152) << " GiB), "
-                          << map.volumes.size() << " volumes\n";
-                for (size_t i = 0; i < map.volumes.size(); ++i) {
-                    const auto& v = map.volumes[i];
-                    std::cout << "  v" << i << " " << (v.fs.empty() ? "raw" : v.fs) << " lba "
-                              << v.lba << " sectors " << v.sectors << " cluster " << v.cluster
-                              << " data_base " << v.data_base << " blocks "
-                              << (v.last - v.first + 1);
-                    if (!v.label.empty()) {
-                        std::cout << " label '" << v.label << "'";
+                bool standard = false;
+                if (std::getenv("ADI_EXTRACT_LEGACY_ONLY") == nullptr) {
+                    if (auto std_img = adi::parse_standard(file, std::cout)) {
+                        std::cout << "map: standard 0x201/0x202/0x109 records, disk "
+                                  << std_img->disk_sectors << " sectors, "
+                                  << std_img->volumes.size() << " volumes\n";
+                        for (size_t i = 0; i < std_img->volumes.size(); ++i) {
+                            const auto& v = std_img->volumes[i];
+                            std::cout << "  v" << i << " lba " << v.lba << " sectors "
+                                      << v.sectors << " cluster " << v.cluster
+                                      << " blocks " << v.blocks << " label '"
+                                      << v.label << "'\n";
+                        }
+                        written = adi::reconstruct_standard(file, *std_img, img);
+                        standard = true;
                     }
-                    std::cout << "\n";
                 }
-                written = adi::reconstruct_image(file, blocks, map, img, cap);
+                if (!standard) {
+                    std::cout << "no standard record sets; using legacy signature scan\n";
+                    auto blocks = adi::block_index(file, cache, std::cout);
+                    auto map = adi::discover_map(file, blocks, outdir / "map.csv");
+                    std::cout << "map: " << map.source << "\ndisk " << map.disk_sectors
+                              << " sectors (" << (map.disk_sectors / 2097152) << " GiB), "
+                              << map.volumes.size() << " volumes\n";
+                    for (size_t i = 0; i < map.volumes.size(); ++i) {
+                        const auto& v = map.volumes[i];
+                        std::cout << "  v" << i << " " << (v.fs.empty() ? "raw" : v.fs)
+                                  << " lba " << v.lba << " sectors " << v.sectors
+                                  << " cluster " << v.cluster << " data_base "
+                                  << v.data_base << " blocks "
+                                  << (v.last - v.first + 1);
+                        if (!v.label.empty()) {
+                            std::cout << " label '" << v.label << "'";
+                        }
+                        std::cout << "\n";
+                    }
+                    written = adi::reconstruct_image(file, blocks, map, img, cap);
+                }
                 std::cout << "wrote " << written << " bytes -> " << img.string() << "\n";
             }
             auto geo = adi::inspect_image(img);

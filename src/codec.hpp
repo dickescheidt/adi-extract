@@ -71,6 +71,11 @@ public:
     const BlockRec* next_chunk(const uint8_t** data, size_t* size);
     size_t read(uint8_t* dst, size_t max);
 
+    /// Decode one self-contained compressed block from memory, with a fresh
+    /// LZ4 window. Real AOMEI VDB blocks never reference another block's
+    /// output, so the standard record path uses this instead of next_chunk().
+    bool decode_buffer(const uint8_t* src, size_t n, const uint8_t** out, size_t* out_n);
+
     uint64_t out_pos() const { return produced_; }
     size_t block_index() const { return blk_; }
     uint64_t bad_blocks() const { return bad_blocks_; }

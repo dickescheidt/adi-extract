@@ -257,6 +257,36 @@ std::vector<BlockRec> block_index(const AdiFile& file, const std::string& cache,
 Lz4Stream::Lz4Stream(const AdiFile& file, const std::vector<BlockRec>& blocks)
     : file_(file), blocks_(blocks), in_(kInBuf), out_(kHistory + kWork) {}
 
+bool Lz4Stream::decode_buffer(const uint8_t* src, size_t n, const uint8_t** out,
+                              size_t* out_n) {
+    *out = nullptr;
+    *out_n = 0;
+    // Fresh state: no 64 KiB history from a previous block.
+    std::fill(out_.begin(), out_.end(), 0);
+    base_ = 0;
+    len_ = 0;
+    cur_ = 0;
+    produced_ = 0;
+    error_.clear();
+    in_.assign(std::max(n, kInBuf), 0);
+    std::memcpy(in_.data(), src, n);
+    in_base_ = 0;
+    in_have_ = n;
+    in_used_ = 0;
+    in_end_ = n;  // fed == in_end_, so in_avail() never touches the file
+    while (in_pos() < in_end_) {
+        if (!step()) {
+            break;
+        }
+    }
+    if (!error_.empty()) {
+        return false;
+    }
+    *out = out_.data() + base_;
+    *out_n = len_ - base_;
+    return true;
+}
+
 void Lz4Stream::fail(const char* what) {
     if (error_.empty()) {
         error_ = what;
@@ -284,7 +314,10 @@ bool Lz4Stream::next_block() {
         len_ = 0;
         cur_ = 0;
     }
-    in_base_ = file_.payload_offset() + b.off;
+    // BlockRec::off is a VDB ImgOffset, i.e. an image-set LOGICAL offset.
+    // The old code added payload_offset() here, which is only correct for a
+    // single-member image with DataOffInSet == 0.
+    in_base_ = b.off;
     in_end_ = in_base_ + b.csize;
     in_have_ = 0;
     in_used_ = 0;
@@ -307,7 +340,7 @@ bool Lz4Stream::in_avail(size_t n) {
     if (fed < in_end_) {
         const size_t want =
             static_cast<size_t>(std::min<uint64_t>(in_.size() - in_have_, in_end_ - fed));
-        file_.read(fed, in_.data() + in_have_, want);
+        file_.read_logical(fed, in_.data() + in_have_, want);
         in_have_ += want;
     }
     return in_have_ - in_used_ >= n;

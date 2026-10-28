@@ -2,6 +2,7 @@
 
 #include "adi_file.hpp"
 #include "codec.hpp"
+#include "records.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -36,6 +37,11 @@ struct Volume {
     uint64_t stored = 0;
     std::string fs;
     std::string label;
+    /// Recovered from a 0x102 volume-metadata record (zero => guess).
+    uint8_t type_guid[16]{};
+    uint8_t unique_guid[16]{};
+    /// UTF-16 GPT partition name recovered from 0x102 (empty => guess).
+    std::string part_name;
 };
 
 struct SectorMap {
@@ -62,5 +68,10 @@ SectorMap discover_map(const AdiFile& file, const std::vector<BlockRec>& blocks,
 uint64_t reconstruct_image(const AdiFile& file, const std::vector<BlockRec>& blocks,
                            const SectorMap& map, const std::filesystem::path& out_img,
                            uint64_t max_bytes = 0);
+
+/// Reconstruct from CRC-valid standard records: exact 0x109 geometry, 0x102
+/// disk placement, and image-set logical reads for every stored block.
+uint64_t reconstruct_standard(const AdiFile& file, const StandardImage& std_img,
+                              const std::filesystem::path& out_img);
 
 }  // namespace adi

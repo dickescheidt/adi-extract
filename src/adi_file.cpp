@@ -1,4 +1,5 @@
 #include "adi_file.hpp"
+#include "codec.hpp"
 #include "text.hpp"
 
 #include <algorithm>
@@ -72,7 +73,9 @@ uint32_t crc32_ieee(const uint8_t* data, size_t n, uint32_t seed) {
     return crc ^ 0xFFFFFFFFu;
 }
 
-AdiFile::AdiFile(std::filesystem::path path) : path_(std::move(path)) {
+AdiFile::AdiFile(std::filesystem::path path,
+                 std::vector<std::filesystem::path> extra_members)
+    : path_(std::move(path)) {
     HANDLE h = CreateFileW(path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,
                            nullptr);
@@ -91,6 +94,15 @@ AdiFile::AdiFile(std::filesystem::path path) : path_(std::move(path)) {
     }
     parse_header();
     parse_footer();
+
+    std::vector<std::filesystem::path> members;
+    members.push_back(path_);
+    for (const auto& p : extra_members) {
+        if (std::find(members.begin(), members.end(), p) == members.end()) {
+            members.push_back(p);
+        }
+    }
+    image_set_ = ImageSet::from_paths(members);
 }
 
 AdiFile::~AdiFile() {
@@ -133,6 +145,14 @@ std::vector<uint8_t> AdiFile::read_vec(uint64_t offset, size_t n) const {
     return v;
 }
 
+void AdiFile::read_logical(uint64_t offset, void* dst, size_t n) const {
+    image_set_.read(offset, dst, n);
+}
+
+std::vector<uint8_t> AdiFile::read_logical_vec(uint64_t offset, size_t n) const {
+    return image_set_.read_vec(offset, n);
+}
+
 uint64_t AdiFile::payload_end() const {
     if (footer_.size && footer_.size < file_size_) {
         return file_size_ - footer_.size;
@@ -155,6 +175,10 @@ void AdiFile::parse_header() {
         throw std::runtime_error("implausible BIFH size");
     }
     auto hdr = read_vec(0, header_.size);
+    std::vector<uint8_t> header_crc_check = hdr;
+    std::fill(header_crc_check.begin() + 8, header_crc_check.begin() + 12, 0);
+    header_.crc_valid =
+        br_crc32(header_crc_check.data(), header_crc_check.size()) == header_.checksum;
     std::copy(hdr.data() + 0x10, hdr.data() + 0x20, header_.guid_a.bytes);
     std::copy(hdr.data() + 0x20, hdr.data() + 0x30, header_.guid_b.bytes);
     if (header_.size > kHeaderCommentOff) {
@@ -183,6 +207,19 @@ void AdiFile::parse_footer() {
         return;
     }
     auto blob = read_vec(file_size_ - footer_.size, footer_.size);
+    if (blob.size() >= 12) {
+        std::vector<uint8_t> tail_crc_check = blob;
+        std::fill(tail_crc_check.end() - 12, tail_crc_check.end() - 8, 0);
+        footer_.crc_valid =
+            br_crc32(tail_crc_check.data(), tail_crc_check.size()) == footer_.checksum;
+    }
+    // sizeof(BR_IMAGE_FILE_TAIL) is 0x674 in real images. Our small synthetic
+    // fixtures use a 16-byte footer and have no image-set fields.
+    if (blob.size() >= 0x630) {
+        footer_.has_image_set = true;
+        footer_.data_length_in_set = read_u64(blob.data() + 0x620);
+        footer_.data_offset_in_set = read_u64(blob.data() + 0x628);
+    }
     if (blob.size() >= 92) {
         const uint8_t* end = blob.data() + blob.size();
         footer_.offset_a = read_u64(end - 92);
@@ -207,7 +244,8 @@ void AdiFile::print_info() const {
     std::cout << "  magic:     BIFH\n";
     std::cout << "  size:      " << header_.size << " (0x" << std::hex << header_.size
               << std::dec << ")\n";
-    std::cout << "  checksum:  0x" << std::hex << header_.checksum << std::dec << "\n";
+    std::cout << "  checksum:  0x" << std::hex << header_.checksum << std::dec << " ("
+              << (header_.crc_valid ? "BRCrc32 valid" : "not BRCrc32") << ")\n";
     std::cout << "  guid A:    " << header_.guid_a.to_string() << "\n";
     std::cout << "  guid B:    " << header_.guid_b.to_string() << "\n";
     std::cout << "  comment:   " << header_.comment << "\n";
@@ -219,7 +257,20 @@ void AdiFile::print_info() const {
     std::cout << "  magic:     BIFT\n";
     std::cout << "  size:      " << footer_.size << " (0x" << std::hex << footer_.size
               << std::dec << ")\n";
-    std::cout << "  checksum:  0x" << std::hex << footer_.checksum << std::dec << "\n";
+    std::cout << "  checksum:  0x" << std::hex << footer_.checksum << std::dec << " ("
+              << (footer_.crc_valid ? "BRCrc32 valid" : "not BRCrc32") << ")\n";
+    if (footer_.has_image_set) {
+        std::cout << "  image set: DataOffInSet 0x" << std::hex
+                  << footer_.data_offset_in_set << ", DataLenInSet 0x"
+                  << footer_.data_length_in_set << std::dec << "\n";
+    }
+    std::cout << "\n[image-set members]\n";
+    for (const auto& m : image_set_.members()) {
+        std::cout << "  " << m.path.string() << " logical 0x" << std::hex
+                  << m.logical_start << "..0x" << (m.logical_start + m.data_length)
+                  << std::dec << " (" << m.data_length << " bytes), BIFH 0x"
+                  << std::hex << m.header_size << std::dec << "\n";
+    }
     std::cout << "  offset A:  0x" << std::hex << footer_.offset_a << std::dec << "\n";
     std::cout << "  offset B:  0x" << std::hex << footer_.offset_b << std::dec << "\n";
     std::cout << "  field A:   " << footer_.field_a << "\n";
