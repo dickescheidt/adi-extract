@@ -4,6 +4,7 @@
 // the synthetic .adi images never reach.
 
 #include "../src/extract.cpp"
+#include "../src/text.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -361,18 +362,18 @@ static void test_lz4_decode_buffer() {
     adi::Lz4Stream dec(file, none);
     const uint8_t* out = nullptr;
     size_t n = 0;
-    assert(dec.decode_buffer(comp, sizeof(comp), &out, &n));
+    assert(dec.decode_buffer(comp, sizeof(comp), 4, &out, &n));
     assert(n == 4 && std::memcmp(out, "ABCD", 4) == 0);
     // A fresh call must not inherit the previous block's output.
     const uint8_t comp2[] = {0x20, 'X', 'Y'};
-    assert(dec.decode_buffer(comp2, sizeof(comp2), &out, &n));
+    assert(dec.decode_buffer(comp2, sizeof(comp2), 2, &out, &n));
     assert(n == 2 && std::memcmp(out, "XY", 2) == 0);
     const uint8_t repeat[] = {0x1f, 'A', 1, 0, 0};
-    assert(dec.decode_buffer(repeat, sizeof(repeat), &out, &n));
+    assert(dec.decode_buffer(repeat, sizeof(repeat), 20, &out, &n));
     assert(n == 20 && std::all_of(out, out + n, [](uint8_t b) { return b == 'A'; }));
     for (const auto &bad :
          std::vector<std::vector<uint8_t>>{{0xf0}, {0x10, 'X', 0}, {0, 0, 0}, {0x1f, 'A', 1, 0}}) {
-        assert(!dec.decode_buffer(bad.data(), bad.size(), &out, &n));
+        assert(!dec.decode_buffer(bad.data(), bad.size(), 64, &out, &n));
     }
     uint32_t state = 0x15a4e35u;
     for (size_t test = 0; test < 4096; ++test) {
@@ -381,13 +382,49 @@ static void test_lz4_decode_buffer() {
             state = state * 1664525u + 1013904223u;
             byte = static_cast<uint8_t>(state >> 24);
         }
-        (void)dec.decode_buffer(input.data(), input.size(), &out, &n);
-        assert(dec.decode_buffer(comp, sizeof(comp), &out, &n));
+        (void)dec.decode_buffer(input.data(), input.size(), 1u << 20, &out, &n);
+        assert(dec.decode_buffer(comp, sizeof(comp), 4, &out, &n));
         assert(n == 4 && std::memcmp(out, "ABCD", 4) == 0);
     }
+    // A match-length extension encodes 255 output bytes per input byte. The
+    // declared decoded size must cap it instead of growing the buffer.
+    std::vector<uint8_t> bomb = {0x1f, 'A', 0x01, 0x00};
+    bomb.insert(bomb.end(), 200, 0xff);
+    bomb.push_back(0x00);
+    assert(dec.decode_buffer(bomb.data(), bomb.size(), 1u << 20, &out, &n));
+    const size_t expanded = n;
+    assert(expanded > 4096);
+    assert(!dec.decode_buffer(bomb.data(), bomb.size(), 4096, &out, &n));
+    assert(!dec.decode_buffer(bomb.data(), bomb.size(), expanded - 1, &out, &n));
+    assert(dec.decode_buffer(bomb.data(), bomb.size(), expanded, &out, &n));
     std::filesystem::remove(path);
 }
 
+static void test_gpt_name_encoding() {
+    // GPT entry names are UTF-16LE; a UTF-8 label must not degrade to one '?'
+    // per byte, and astral characters must become a surrogate pair.
+    const std::string name = "DATEN-\xc3\x84\xc3\x96\xc3\x9c";  // DATEN-ÄÖÜ
+    const std::string u16 = adi::text::utf8_to_utf16le(name);
+    assert(u16.size() == 2 * 9);  // 6 ASCII + 3 two-byte characters
+    assert(static_cast<uint8_t>(u16[12]) == 0xc4 && static_cast<uint8_t>(u16[13]) == 0x00);
+    const std::string pair = adi::text::utf8_to_utf16le("\xf0\x9f\x92\xbe");  // U+1F4BE
+    assert(pair.size() == 4);
+    const uint16_t hi =
+        static_cast<uint8_t>(pair[0]) | (static_cast<uint16_t>(static_cast<uint8_t>(pair[1])) << 8);
+    const uint16_t lo =
+        static_cast<uint8_t>(pair[2]) | (static_cast<uint16_t>(static_cast<uint8_t>(pair[3])) << 8);
+    assert(hi == 0xd83d && lo == 0xdcbe);
+    // Invalid UTF-8 must not read past the end or emit a lone surrogate.
+    const std::string junk("\xf0\x28\x8c\x28", 4);
+    const std::string j16 = adi::text::utf8_to_utf16le(junk);
+    assert(j16.size() % 2 == 0);
+    for (size_t i = 0; i + 1 < j16.size(); i += 2) {
+        const uint16_t unit =
+            static_cast<uint8_t>(j16[i]) |
+            (static_cast<uint16_t>(static_cast<uint8_t>(j16[i + 1])) << 8);
+        assert(!(unit >= 0xd800u && unit <= 0xdbffu));
+    }
+}
 
 static void test_malformed_container_construction_does_not_leak() {
 #if defined(__linux__)
@@ -436,6 +473,7 @@ int main() {
     test_split_block_32k();
     test_container_fields_and_members();
     test_lz4_decode_buffer();
+    test_gpt_name_encoding();
     test_malformed_container_construction_does_not_leak();
     std::cout << "SAFETY TESTS PASSED\n";
     return 0;

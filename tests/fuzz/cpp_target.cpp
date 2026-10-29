@@ -99,7 +99,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     static Decoder state;
     const uint8_t* decoded = nullptr;
     size_t n = 0;
-    state.decoder->decode_buffer(data, size, &decoded, &n);
+    state.decoder->decode_buffer(data, size, 1u << 20, &decoded, &n);
     adi::BlockLayout lay;
     adi::split_block(data, static_cast<uint32_t>(size), 0, &lay);
 #elif defined(FUZZ_RECORDS)

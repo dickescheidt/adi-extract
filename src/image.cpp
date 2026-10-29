@@ -1,5 +1,6 @@
 #include "diagnostics.hpp"
 #include "image.hpp"
+#include "text.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -325,14 +326,22 @@ void write_gpt(SparseImage& img, const SectorMap& map) {
                 e[56 + 2 * k] = uint8_t(name[k]);
             }
         } else {
-            // GPT names are UTF-16LE, up to 36 code units. AOMEI labels are
-            // ASCII in practice; emit the low byte of each UTF-8 code unit.
-            size_t k = 0;
-            for (size_t j = 0; j < v.part_name.size() && k < 36; ++j, ++k) {
-                const uint8_t c = static_cast<uint8_t>(v.part_name[j]);
-                e[56 + 2 * k] = c < 0x80 ? c : '?';
-                e[57 + 2 * k] = 0;
+            // GPT names are UTF-16LE, up to 36 code units. Convert the UTF-8
+            // label properly: emitting one byte per UTF-8 unit turned every
+            // non-ASCII character into mojibake such as '??????'.
+            std::string u16 = text::utf8_to_utf16le(v.part_name);
+            constexpr size_t kNameBytes = 72;  // 36 code units
+            if (u16.size() > kNameBytes) {
+                u16.resize(kNameBytes);
+                // Do not leave half a surrogate pair at the end of the field.
+                const auto hi = static_cast<uint8_t>(u16[kNameBytes - 2]);
+                const auto lo = static_cast<uint8_t>(u16[kNameBytes - 1]);
+                const uint16_t last = static_cast<uint16_t>(hi | (lo << 8));
+                if (last >= 0xd800u && last <= 0xdbffu) {
+                    u16.resize(kNameBytes - 2);
+                }
             }
+            std::memcpy(e + 56, u16.data(), u16.size());
         }
         ++n;
     }
@@ -878,7 +887,7 @@ uint64_t reconstruct_standard(const AdiFile& file, const StandardImage& std_img,
             if (std_img.have_compress && std_img.compress_mode == 0)
                 adi::debug_log() << "  warning: compression mode 0 but unequal stored/decoded sizes; "
                              "attempting LZ4; verify output\n";
-            if (!dec.decode_buffer(comp.data(), comp.size(), &data, &n)) {
+            if (!dec.decode_buffer(comp.data(), comp.size(), b.usize, &data, &n)) {
                 std::cerr << "  warning: block at logical 0x" << std::hex << b.off
                           << std::dec << ": LZ4 decode failed: " << dec.error() << "\n";
                 ++odd;
@@ -976,6 +985,11 @@ uint64_t reconstruct_standard(const AdiFile& file, const StandardImage& std_img,
             ++units;
         }
         flush();
+    }
+    if (!written && !std_img.blocks.empty()) {
+        throw std::runtime_error(
+            "no VDB block could be decoded; nothing was recovered from " +
+            std::to_string(std_img.blocks.size()) + " block(s)");
     }
     std::cout << "  " << units << " units placed, " << crc_checked
               << " BRCrc32 checked, " << crc_bad << " bad";

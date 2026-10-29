@@ -198,6 +198,29 @@ inline std::string wstring_to_utf8(const wchar_t* src, size_t n) {
     return out;
 }
 
+inline void append_utf16le(std::string& out, uint32_t unit) {
+    out.push_back(static_cast<char>(unit & 0xffu));
+    out.push_back(static_cast<char>((unit >> 8) & 0xffu));
+}
+
+/// UTF-8 -> UTF-16LE bytes, no terminator. Invalid input becomes U+FFFD.
+/// Used for GPT partition names, which are a fixed UTF-16LE field.
+inline std::string utf8_to_utf16le(const std::string& s) {
+    std::string out;
+    for (uint32_t cp : utf8_to_codepoints(s.data(), s.size())) {
+        if (cp >= 0x10000u) {
+            const uint32_t v = cp - 0x10000u;
+            append_utf16le(out, 0xd800u + (v >> 10));
+            append_utf16le(out, 0xdc00u + (v & 0x3ffu));
+        } else if (cp >= 0xd800u && cp <= 0xdfffu) {
+            append_utf16le(out, 0xfffdu);  // lone surrogate: not encodable
+        } else {
+            append_utf16le(out, cp);
+        }
+    }
+    return out;
+}
+
 inline std::wstring utf8_to_wstring(const char* src, size_t n) {
     const auto cps = utf8_to_codepoints(src, n);
     std::wstring out;

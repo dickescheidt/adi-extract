@@ -74,7 +74,13 @@ public:
     /// Decode one self-contained compressed block from memory, with a fresh
     /// LZ4 window. Real AOMEI VDB blocks never reference another block's
     /// output, so the standard record path uses this instead of next_chunk().
-    bool decode_buffer(const uint8_t* src, size_t n, const uint8_t** out, size_t* out_n);
+    ///
+    /// `limit` is the block's declared decoded size (VDB `OldSize`). A single
+    /// match-length extension byte encodes 255 output bytes, so without the
+    /// ceiling a few hundred kilobytes of crafted input can request gigabytes
+    /// of allocation. Exceeding `limit` fails like any other decode error.
+    bool decode_buffer(const uint8_t* src, size_t n, size_t limit, const uint8_t** out,
+                       size_t* out_n);
 
     uint64_t out_pos() const { return produced_; }
     size_t block_index() const { return blk_; }
@@ -94,7 +100,7 @@ private:
     bool in_avail(size_t n);
     bool in_byte(uint8_t* out);
     bool in_copy(uint8_t* dst, size_t n);
-    void reserve_out(size_t extra);
+    bool ensure_out(size_t extra);
     void fail(const char* what);
     uint64_t in_pos() const { return in_base_ + in_used_; }
 
@@ -104,6 +110,8 @@ private:
     uint64_t in_end_ = 0;
     uint64_t block_out_start_ = 0;
     uint64_t bad_blocks_ = 0;
+    /// Ceiling for this block's output; reset per block and per decode_buffer call.
+    size_t limit_ = static_cast<size_t>(-1);
 
     std::vector<uint8_t> in_;
     uint64_t in_base_ = 0;

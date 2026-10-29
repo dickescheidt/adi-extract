@@ -259,10 +259,11 @@ std::vector<BlockRec> block_index(const AdiFile& file, const std::string& cache,
 Lz4Stream::Lz4Stream(const AdiFile& file, const std::vector<BlockRec>& blocks)
     : file_(file), blocks_(blocks), in_(kInBuf), out_(kHistory + kWork) {}
 
-bool Lz4Stream::decode_buffer(const uint8_t* src, size_t n, const uint8_t** out,
-                              size_t* out_n) {
+bool Lz4Stream::decode_buffer(const uint8_t* src, size_t n, size_t limit,
+                              const uint8_t** out, size_t* out_n) {
     *out = nullptr;
     *out_n = 0;
+    limit_ = limit;
     // Fresh state: no 64 KiB history from a previous block.
     std::fill(out_.begin(), out_.end(), 0);
     base_ = 0;
@@ -322,6 +323,9 @@ bool Lz4Stream::next_block() {
     // single-member image with DataOffInSet == 0.
     in_base_ = b.off;
     in_end_ = in_base_ + b.csize;
+    // The same ceiling applies to chained decoding: each block declares its
+    // decoded size, so a crafted length extension must not grow the buffer.
+    limit_ = b.usize;
     in_have_ = 0;
     in_used_ = 0;
     block_out_start_ = produced_;
@@ -371,10 +375,18 @@ bool Lz4Stream::in_copy(uint8_t* dst, size_t n) {
     return true;
 }
 
-void Lz4Stream::reserve_out(size_t extra) {
+bool Lz4Stream::ensure_out(size_t extra) {
+    // Count only this block's output: `out_` still holds up to 64 KiB of
+    // back-reference history from the previous block, below `base_`.
+    const size_t produced = len_ - base_;
+    if (extra > limit_ || produced > limit_ - extra) {
+        fail("decoded output exceeds the declared block size");
+        return false;
+    }
     if (len_ + extra > out_.size()) {
         out_.resize(len_ + extra + kWork);
     }
+    return true;
 }
 
 bool Lz4Stream::step() {
@@ -394,7 +406,9 @@ bool Lz4Stream::step() {
         } while (b == 255);
     }
     if (lit) {
-        reserve_out(lit);
+        if (!ensure_out(lit)) {
+            return false;
+        }
         if (!in_copy(out_.data() + len_, lit)) {
             fail("truncated literals");
             return false;
@@ -428,7 +442,9 @@ bool Lz4Stream::step() {
         } while (b == 255);
     }
     mlen += 4;
-    reserve_out(mlen);
+    if (!ensure_out(mlen)) {
+        return false;
+    }
     uint8_t* dst = out_.data() + len_;
     const uint8_t* src = dst - off;
     for (size_t i = 0; i < mlen; ++i) {
