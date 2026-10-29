@@ -193,13 +193,13 @@ int main(int argc, char** argv) {
     try {
         const std::string cache = argc > 2 ? std::string(argv[2]) + ".index" : std::string();
         if (cmd == "info") {
-            adi::debug_log() << "warning: info does not verify all decoded block contents/checksums; use "
-                         "extraction diagnostics and independent filesystem checks\n";
+            adi::debug_log() << "warning: info verifies a sample of decoded blocks; use reconstruct "
+                         "for a full check of every block\n";
             adi::AdiFile file(argv[2], adi::extra_member_paths("ADI_EXTRACT_MEMBERS"));
             file.print_info();
             if (std::getenv("ADI_EXTRACT_LEGACY_ONLY") == nullptr) {
                 if (auto std_img = adi::parse_standard(file, std::cout)) {
-                    adi::print_standard_info(*std_img, std::cout);
+                    adi::print_standard_info(*std_img, std::cout, &file);
                     return 0;
                 }
             }
@@ -310,6 +310,18 @@ int main(int argc, char** argv) {
                     written = adi::reconstruct_image(file, blocks, map, img, cap);
                 }
                 std::cout << "wrote " << written << " bytes -> " << img.string() << "\n";
+                // A recovery tool must say how much of the image it filled in: the
+                // exit status cannot tell "every cluster was free" apart from
+                // "most of the disk is a hole".
+                const uint64_t image_size = fs::file_size(img);
+                const uint64_t zero = image_size > written ? image_size - written : 0;
+                std::cout << "data: " << written << " bytes of block data placed, " << zero
+                          << " bytes left zero (" << std::fixed << std::setprecision(3)
+                          << (image_size ? 100.0 * static_cast<double>(written) /
+                                               static_cast<double>(image_size)
+                                         : 0.0)
+                          << "% of the " << image_size << "-byte image)\n"
+                          << std::defaultfloat;
             }
             auto geo = adi::inspect_image(img);
             std::cout << "partition style: " << geo.partition_style << ", "

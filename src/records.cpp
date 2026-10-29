@@ -533,6 +533,130 @@ std::vector<Set> find_sets(const AdiFile& file) {
 
 }  // namespace
 
+namespace {
+
+std::string probe_volume_boot_1(const AdiFile& file, const std::vector<StdBlock>& blocks,
+                                uint64_t volume_start);
+
+std::string label_fs(const std::string& label) {
+    std::string upper = label;
+    std::transform(upper.begin(), upper.end(), upper.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    return upper.find("ESP") != std::string::npos || upper.find("EFI") != std::string::npos
+               ? "FAT32"
+               : "NTFS";
+}
+
+/// Decode the block that stores the volume's first cluster and read its boot
+/// sector. Empty string when that block is absent, undecodable, or does not
+/// start with a recognisable boot sector.
+std::string probe_volume_boot(const AdiFile& file, const std::vector<StdBlock>& blocks,
+                              uint64_t volume_start) {
+    try {
+        return probe_volume_boot_1(file, blocks, volume_start);
+    } catch (const std::exception&) {
+        return {};   // a missing image-set member must not abort discovery
+    }
+}
+
+std::string probe_volume_boot_1(const AdiFile& file, const std::vector<StdBlock>& blocks,
+                                uint64_t volume_start) {
+    const StdBlock* first = nullptr;
+    for (const StdBlock& b : blocks) {
+        if (b.block_no != 0 || b.base != volume_start || b.cluster == 0 || b.bitmap_len == 0) {
+            continue;
+        }
+        if (!first || b.off < first->off) {
+            first = &b;
+        }
+    }
+    if (!first) {
+        return {};
+    }
+    const auto comp = file.read_logical_vec(first->off, first->csize);
+    if (comp.empty() && first->csize != 0) {
+        return {};
+    }
+    const std::vector<BlockRec> none;
+    Lz4Stream dec(file, none);
+    const uint8_t* data = nullptr;
+    size_t n = 0;
+    if (first->csize == first->usize) {
+        data = comp.data();
+        n = comp.size();
+    } else if (!dec.decode_buffer(comp.data(), comp.size(), first->usize, &data, &n)) {
+        return {};
+    }
+    if (n != first->usize || n < first->bitmap_len + 512 || (data[0] & 1) == 0) {
+        return {};
+    }
+    BootSector bs;
+    if (!parse_boot_sector(data + first->bitmap_len, n - first->bitmap_len, &bs)) {
+        return {};
+    }
+    return bs.fs;
+}
+
+std::pair<uint64_t, uint64_t> decode_and_check_1(const AdiFile& file, const StandardImage& s,
+                                                 size_t index) {
+    if (index >= s.blocks.size()) {
+        return {0, 0};
+    }
+    const StdBlock& b = s.blocks[index];
+    if (b.crc == 0) {
+        return {0, 0};
+    }
+    const auto comp = file.read_logical_vec(b.off, b.csize);
+    const std::vector<BlockRec> none;
+    Lz4Stream dec(file, none);
+    const uint8_t* data = nullptr;
+    size_t n = 0;
+    if (b.csize == b.usize) {
+        data = comp.data();
+        n = comp.size();
+    } else if (!dec.decode_buffer(comp.data(), comp.size(), b.usize, &data, &n)) {
+        return {0, 0};
+    }
+    if (n != b.usize) {
+        return {0, 0};
+    }
+    return {1, br_crc32(data, n) == b.crc ? 0u : 1u};
+}
+
+/// An unreadable block (for example one that lives in a missing image-set
+/// member) counts as unchecked, not as an error: `info` must not fail because a
+/// sample could not be read.
+std::pair<uint64_t, uint64_t> decode_and_check(const AdiFile& file, const StandardImage& s,
+                                               size_t index) {
+    try {
+        return decode_and_check_1(file, s, index);
+    } catch (const std::exception&) {
+        return {0, 0};
+    }
+}
+
+}  // namespace
+
+std::pair<uint64_t, uint64_t> verify_standard_sample(const AdiFile& file,
+                                                     const StandardImage& std_img, size_t k) {
+    const size_t total = std_img.blocks.size();
+    if (total == 0 || k == 0) {
+        return {0, 0};
+    }
+    uint64_t checked = 0;
+    uint64_t bad = 0;
+    const size_t step = total <= k ? 1 : total / k;
+    for (size_t i = 0; i < total && (total <= k ? true : checked + bad < k * 4); i += step) {
+        const auto r = decode_and_check(file, std_img, i);
+        checked += r.first;
+        bad += r.second;
+        if (total > k && (i + step) / step > k) {
+            break;
+        }
+    }
+    return {checked, bad};
+}
+
 std::optional<StandardImage> parse_standard(const AdiFile& file, std::ostream& progress) {
     const std::vector<Set> sets = find_sets(file);
     if (sets.empty()) {
@@ -540,8 +664,6 @@ std::optional<StandardImage> parse_standard(const AdiFile& file, std::ostream& p
     }
     adi::debug_log() << "  warning: output uses a reconstructed GPT/disk extent, not a verified copy of "
                  "the original partition table; verify layout and filesystem before use\n";
-    adi::debug_log() << "  warning: standard-path filesystem type display is inferred from volume labels, "
-                 "not verified filesystem contents\n";
     StandardImage out;
     for (const Set& set : sets) {
         RecordSetInfo info;
@@ -595,16 +717,6 @@ std::optional<StandardImage> parse_standard(const AdiFile& file, std::ostream& p
         const uint32_t cluster = set.regions.empty()
                                      ? 512
                                      : static_cast<uint32_t>(set.regions[0].cluster());
-        const std::string upper = [&] {
-            std::string s = label;
-            std::transform(s.begin(), s.end(), s.begin(),
-                           [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-            return s;
-        }();
-        const std::string fs =
-            upper.find("ESP") != std::string::npos || upper.find("EFI") != std::string::npos
-                ? "FAT32"
-                : "NTFS";
 
         std::map<uint32_t, Region> region_map;
         for (const Region& r : set.regions) {
@@ -633,9 +745,16 @@ std::optional<StandardImage> parse_standard(const AdiFile& file, std::ostream& p
         }
         out.sets.push_back(std::move(info));
 
+        std::vector<uint32_t> region_clusters;
+        for (const Region& r : set.regions) {
+            region_clusters.push_back(static_cast<uint32_t>(r.cluster()));
+        }
+        std::sort(region_clusters.begin(), region_clusters.end());
+        region_clusters.erase(std::unique(region_clusters.begin(), region_clusters.end()),
+                              region_clusters.end());
         StdVolume vol;
         vol.label = label;
-        vol.fs = fs;
+        vol.region_clusters = region_clusters;
         vol.part_name = label.empty() ? description : label;
         vol.lba = part_start;
         vol.sectors = sectors;
@@ -661,6 +780,7 @@ std::optional<StandardImage> parse_standard(const AdiFile& file, std::ostream& p
             out.have_encrypt = true;
             out.encrypt_mode = set.encrypt_mode;
         }
+        const size_t set_block_start = out.blocks.size();
         for (const VdbEntry& e : set.entries) {
             const auto it = region_map.find(e.reg_no);
             if (it == region_map.end() || e.old_size == 0 || e.new_size == 0) {
@@ -693,6 +813,20 @@ std::optional<StandardImage> parse_standard(const AdiFile& file, std::ostream& p
             out.blocks.push_back(b);
             ++vol.blocks;
         }
+        // The volume's first cluster holds its boot sector, which names the real
+        // filesystem. The label heuristic is only a fallback: it calls everything
+        // NTFS unless the label says ESP/EFI, which is wrong for FAT cards.
+        const std::vector<StdBlock> set_blocks(out.blocks.begin() + set_block_start,
+                                               out.blocks.end());
+        std::string fs = probe_volume_boot(file, set_blocks, part_start * bps);
+        vol.fs_detected = !fs.empty();
+        if (!vol.fs_detected) {
+            adi::debug_log() << "  warning: volume at LBA " << part_start
+                             << ": boot sector not recoverable; filesystem '"
+                             << label_fs(label) << "' is inferred from the label; verify output\n";
+            fs = label_fs(label);
+        }
+        vol.fs = fs;
         out.volumes.push_back(std::move(vol));
     }
     const auto unchecked = std::count_if(out.blocks.begin(), out.blocks.end(),
@@ -731,7 +865,18 @@ std::optional<StandardImage> parse_standard(const AdiFile& file, std::ostream& p
     return out;
 }
 
-void print_standard_info(const StandardImage& s, std::ostream& out) {
+std::string cluster_label(const std::vector<uint32_t>& region_clusters, uint32_t fallback) {
+    if (region_clusters.empty()) return std::to_string(fallback);
+    if (region_clusters.size() == 1) return std::to_string(region_clusters[0]);
+    std::string out = "mixed (";
+    for (size_t k = 0; k < region_clusters.size(); ++k) {
+        if (k) out += ", ";
+        out += std::to_string(region_clusters[k]);
+    }
+    return out + ")";
+}
+
+void print_standard_info(const StandardImage& s, std::ostream& out, const AdiFile* file) {
     out << "\n[standard records]\n";
     out << "  volume record sets: " << s.sets.size() << "\n";
     for (size_t i = 0; i < s.sets.size(); ++i) {
@@ -758,6 +903,14 @@ void print_standard_info(const StandardImage& s, std::ostream& out) {
         }
     }
     out << "  crcs:       " << crcs << " blocks carry a BRCrc32 checksum\n";
+    if (crcs != 0 && file != nullptr) {
+        // info used to print the checksum count without ever testing one.
+        const auto [checked, bad] = verify_standard_sample(*file, s, 16);
+        out << "  verified:  " << checked << " of " << crcs << " decoded blocks checked, "
+            << bad << (bad == 1 ? " mismatch, " : " mismatches, ")
+            << (crcs > checked ? crcs - checked : 0)
+            << " unchecked (reconstruct verifies every block)\n";
+    }
     if (s.skipped_regions) {
         out << "  skipped:    " << s.skipped_regions
             << " VDB entries with no matching region\n";
@@ -765,9 +918,17 @@ void print_standard_info(const StandardImage& s, std::ostream& out) {
     out << "\n[volumes]\n";
     for (size_t i = 0; i < s.volumes.size(); ++i) {
         const auto& v = s.volumes[i];
-        out << "  v" << i << " lba " << v.lba << ", " << v.sectors
-            << " sectors, cluster " << v.cluster << ", " << v.blocks
+        out << "  v" << i << " " << v.fs << (v.fs_detected ? "" : "?") << " lba " << v.lba
+            << ", " << v.sectors << " sectors, cluster "
+            << cluster_label(v.region_clusters, v.cluster) << ", " << v.blocks
             << " blocks, label '" << v.label << "'\n";
+    }
+    for (const auto& v : s.volumes) {
+        if (!v.fs_detected) {
+            out << "  ('?' = filesystem guessed from the label; its boot sector was not "
+                   "recoverable)\n";
+            break;
+        }
     }
     out << "\n[raw image]\n";
     out << "  disk:      " << s.disk_sectors << " sectors\n";

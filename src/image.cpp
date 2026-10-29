@@ -252,7 +252,14 @@ struct PartType {
 };
 
 PartType part_type(const Volume& v, bool last) {
-    if (v.fs.rfind("FAT", 0) == 0 && v.lba <= 4096) {
+    // An EFI system partition is FAT *and* labelled as one. The old rule only
+    // asked for "FAT near the start of the disk", which mislabels an ordinary FAT
+    // data volume now that the filesystem is detected instead of guessed.
+    std::string upper = v.label;
+    std::transform(upper.begin(), upper.end(), upper.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    if (v.fs.rfind("FAT", 0) == 0 &&
+        (upper.find("ESP") != std::string::npos || upper.find("EFI") != std::string::npos)) {
         return {kEspGuid, "EFI system partition"};
     }
     if (v.fs.empty() || v.fs == "raw") {

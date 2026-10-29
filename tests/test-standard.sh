@@ -58,3 +58,4 @@ python3 tests/test_properties.py ./adi-extract cpp
 python3 tests/test_malformed.py ./adi-extract cpp
 python3 tests/test_trace.py ./adi-extract cpp
 python3 tests/test_robustness.py ./adi-extract cpp
+python3 tests/test_fs_detect.py ./adi-extract cpp

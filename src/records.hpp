@@ -4,6 +4,7 @@
 #include <iosfwd>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace adi {
@@ -27,7 +28,13 @@ struct StdBlock {
 
 struct StdVolume {
     std::string label;
+    /// From the volume's own boot sector when that block is recoverable,
+    /// otherwise the label heuristic (see fs_detected).
     std::string fs;
+    /// True when `fs` was read from a boot sector rather than guessed.
+    bool fs_detected = false;
+    /// Distinct cluster sizes across the volume's regions, ascending.
+    std::vector<uint32_t> region_clusters;
     std::string part_name;
     uint64_t lba = 0;
     uint64_t sectors = 0;
@@ -63,6 +70,20 @@ struct StandardImage {
 /// the image has no standard record sets (synthetic/older images).
 std::optional<StandardImage> parse_standard(const AdiFile& file, std::ostream& progress);
 
-void print_standard_info(const StandardImage& std_img, std::ostream& out);
+/// Print the record summary. When `file` is given, a bounded sample of blocks is
+/// decoded and their BRCrc32 verified, and the result is printed after the
+/// checksum count.
+void print_standard_info(const StandardImage& std_img, std::ostream& out,
+                         const AdiFile* file = nullptr);
+
+/// Cluster size shown in the volume line. Regions may disagree: a real card had
+/// 32 KiB clusters in one region and 4 KiB in the other, and printing just the
+/// first region's value was misleading.
+std::string cluster_label(const std::vector<uint32_t>& region_clusters, uint32_t fallback);
+
+/// Decode up to `k` evenly spread blocks and compare their BRCrc32.
+/// Returns (checked, mismatched).
+std::pair<uint64_t, uint64_t> verify_standard_sample(const AdiFile& file,
+                                                     const StandardImage& std_img, size_t k);
 
 }  // namespace adi

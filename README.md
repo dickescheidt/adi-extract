@@ -14,6 +14,11 @@ adi-extract extract     <file.adi> <outdir>
 
 `reconstruct <file.adi> <disk.img>` writes a flat raw disk image (sparse, with a
 reconstructed GPT) that can be mounted, carved or converted with `qemu-img`.
+After a successful run it reports how much of the image holds recovered data,
+e.g. `data: 196608 bytes of block data placed, 2966528 bytes left zero (6.216%
+of the 3163136-byte image)`. The two numbers add up to the image size, so a
+mostly empty image is easy to tell apart from a truncated one.
+
 **Linux/macOS:** this fork also builds natively — see [POSIX.md](POSIX.md).
 
 Unofficial tool, not affiliated with AOMEI. Use at your own risk.
@@ -31,8 +36,10 @@ format version and is regenerated automatically when the parser changes.
 Each entry's `Crc32` is AOMEI's `BRCrc32`: CRC32C/Castagnoli, zero seed, final
 inversion, checked over the **decoded** block bytes. `reconstruct` and `scan`
 verify it and skip (with a warning) any block that fails; `info` reports how
-many entries carry a checksum, and `scan`'s report lists checked/bad counts.
-Entries with a zero checksum field are treated as "no checksum".
+many entries carry a checksum and decodes an evenly spread sample of them,
+printing `verified: C of T decoded blocks checked, B mismatches, U unchecked`;
+`scan`'s report lists checked/bad counts. Entries with a zero checksum field
+are treated as "no checksum".
 
 Decoded blocks are a used-sector bitmap followed by only the present clusters.
 Cluster sizes from 512 B to 64 KiB are recognised, including the 32 KiB
@@ -52,9 +59,18 @@ records and the VDB table itself.
 With that path the block geometry and the partition's absolute start LBA, size,
 GPT type GUID, unique GUID and label are recovered from the records instead of
 being guessed from boot sectors, and the real 0x20-byte VDB entries are read
-directly. If no CRC-valid record set exists (synthetic or older images), the
-tool falls back to the signature-scan parser. Set `ADI_EXTRACT_LEGACY_ONLY=1`
-to force that fallback.
+directly.
+
+The filesystem in `info`'s volume line is read from each volume's own boot
+sector. If that sector did not survive, the name is guessed from the volume
+label and printed with a trailing `?` plus a footnote. Regions that disagree on
+the cluster size are listed in full, e.g. `cluster mixed (4096, 32768)`. A FAT
+volume only becomes an EFI system partition in the synthesised GPT when its
+label says ESP or EFI.
+
+If no CRC-valid record set exists (synthetic or older images), the tool falls
+back to the signature-scan parser. Set `ADI_EXTRACT_LEGACY_ONLY=1` to force that
+fallback.
 
 `ImgOffset` in a VDB entry is a **logical image-set offset**, not a raw file
 offset. Reads use `physical = logical - DataOffInSet + BIFH.size`, with
@@ -93,8 +109,9 @@ not the recovered bytes or exit status.
 Extended diagnostics cover unknown referenced records, rejected record-set
 candidates, missing or ambiguous metadata/modes, absent/unverified checksums,
 image-set gaps/overlaps, and inferred geometry or partition metadata. They also
-explain that `info` does not decode and verify all payload blocks. Correctly
-bounded partial final blocks are supported, not a geometry warning.
+say when a filesystem was guessed from the volume label and when `info` only
+verified a sample of decoded blocks. Correctly bounded partial final blocks are
+supported, not a geometry warning.
 
 A zero exit status is not proof of a complete or exact restore. Review recovery
 warnings; do not use partial output left by a failed command. This is a

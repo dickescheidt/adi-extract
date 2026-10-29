@@ -201,6 +201,13 @@ static void test_runs_and_fixup() {
 
 // --- VDB cross-check regressions ------------------------------------------
 
+static void test_cluster_label() {
+    assert(cluster_label({}, 4096) == "4096");
+    assert(cluster_label({4096}, 512) == "4096");
+    assert(cluster_label({4096, 32768}, 4096) == "mixed (4096, 32768)");
+    std::cout << "  cluster sizes: mixed-region line\n";
+}
+
 static void test_br_crc32() {
     // AOMEI Encrypt.dll!BRCrc32 is CRC32C, not zlib's CRC32.
     const uint8_t* empty = reinterpret_cast<const uint8_t*>("");
@@ -468,6 +475,7 @@ int main() {
     test_shim_conversions();
     test_mft_bounds();
     test_runs_and_fixup();
+    test_cluster_label();
     test_br_crc32();
     test_resolve_regions();
     test_split_block_32k();
