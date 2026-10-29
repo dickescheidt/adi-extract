@@ -226,6 +226,37 @@ static void test_br_crc32() {
     assert(!block_crc_ok(b, data.data(), data.size()));
 }
 
+/// The slicing-by-16 loop must agree with the definition of the algorithm at
+/// every length, not only where a block happens to end.
+static void test_br_crc32_matches_reference() {
+    auto reference = [](const uint8_t* p, size_t n) {
+        uint32_t crc = 0;
+        for (size_t i = 0; i < n; ++i) {
+            crc ^= p[i];
+            for (int k = 0; k < 8; ++k) {
+                crc = (crc & 1u) ? ((crc >> 1) ^ 0x82F63B78u) : (crc >> 1);
+            }
+        }
+        return ~crc;
+    };
+    std::vector<uint8_t> data(300);
+    uint32_t x = 0x12345678u;
+    for (auto& byte : data) {
+        x = x * 1103515245u + 12345u;
+        byte = static_cast<uint8_t>(x >> 16);
+    }
+    for (size_t n = 0; n <= data.size(); ++n) {
+        assert(br_crc32(data.data(), n) == reference(data.data(), n));
+    }
+    std::vector<uint8_t> long_buf(100003);
+    for (size_t i = 0; i < long_buf.size(); ++i) {
+        long_buf[i] = static_cast<uint8_t>((i * 31) >> 3);
+    }
+    assert(br_crc32(long_buf.data(), long_buf.size()) ==
+           reference(long_buf.data(), long_buf.size()));
+    std::cout << "  br_crc32: slicing-by-16 matches the bit-at-a-time reference\n";
+}
+
 static void test_resolve_regions() {
     // Six blocks in three chain runs with strictly increasing raw regions.
     // A VDB entry's BlockNo describes the *next* block, so the correct result
@@ -477,6 +508,7 @@ int main() {
     test_runs_and_fixup();
     test_cluster_label();
     test_br_crc32();
+    test_br_crc32_matches_reference();
     test_resolve_regions();
     test_split_block_32k();
     test_container_fields_and_members();

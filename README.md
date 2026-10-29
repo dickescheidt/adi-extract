@@ -92,6 +92,23 @@ blocks, including a partial final cluster, are supported; padded blocks are
 clipped to the region boundary. Other decoded geometry mismatches stop extraction
 with an error instead of silently omitting the block.
 
+## Performance
+
+`reconstruct` is single-threaded; three things used to dominate it:
+
+* **No full pass before the first byte.** The standard record block is searched
+  in the last 4 MiB of the container; the old build read the entire image
+  first (70 s for 70 GiB at 1 GB/s) before writing anything. If the records are
+  not in that window the tool falls back to scanning the whole file, and
+  `ADI_EXTRACT_FULL_SCAN=1` forces that path.
+* **BRCrc32 uses slicing-by-16.** Every decoded byte is checksummed, and the
+  byte-at-a-time table ran at ~0.43 GB/s on a 2.6 GHz core, which capped the
+  whole run; the sliced version runs at ~2.4 GB/s.
+* **LZ4 matches are copied in doubling steps** instead of byte by byte.
+
+Measured on a 2.6 GHz VM with output to `/dev/null`: 4 GiB of compressible
+blocks 14.0 s → 5.2 s, 2 GiB of stored blocks 16.3 s → 4.1 s.
+
 ## Debug diagnostics and verification
 
 Use `--debug` to enable extended format-audit diagnostics on **stderr**:

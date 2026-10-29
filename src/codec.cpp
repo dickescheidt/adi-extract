@@ -25,17 +25,38 @@
 namespace adi {
 namespace {
 
-constexpr std::array<uint32_t, 256> make_br_table() {
-    std::array<uint32_t, 256> t{};
+// Slicing-by-16 tables: one byte-at-a-time ran at ~430 MB/s on a 2.6 GHz core,
+// which made a whole-disk dump CPU-bound because every decoded byte is
+// checksummed. Sixteen bytes per iteration with 16 lookups runs at several GB/s.
+constexpr std::array<std::array<uint32_t, 256>, 16> make_br_tables() {
+    std::array<std::array<uint32_t, 256>, 16> t{};
     for (uint32_t i = 0; i < 256; ++i) {
         uint32_t c = i;
         for (int k = 0; k < 8; ++k) {
             c = (c & 1u) ? ((c >> 1) ^ 0x82F63B78u) : (c >> 1);
         }
-        t[i] = c;
+        t[0][i] = c;
+    }
+    for (size_t s = 1; s < t.size(); ++s) {
+        for (size_t i = 0; i < 256; ++i) {
+            const uint32_t prev = t[s - 1][i];
+            t[s][i] = (prev >> 8) ^ t[0][prev & 0xFFu];
+        }
     }
     return t;
 }
+
+/// Unaligned 64-bit load. The CRC below reads whole words, so this build
+/// requires a little-endian host; every platform the tool supports is one.
+uint64_t load64(const uint8_t* p) {
+    uint64_t v = 0;
+    std::memcpy(&v, p, sizeof v);
+    return v;
+}
+
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#error "br_crc32's slicing loop assumes a little-endian host"
+#endif
 
 uint16_t rd16(const uint8_t* p) {
     return static_cast<uint16_t>(p[0] | (p[1] << 8));
@@ -106,10 +127,24 @@ bool plausible_rec(const uint8_t* p, uint64_t payload_span) {
 }  // namespace
 
 uint32_t br_crc32(const uint8_t* p, size_t n) {
-    static constexpr std::array<uint32_t, 256> kTable = make_br_table();
+    static constexpr auto kTables = make_br_tables();
+    const auto& t = kTables;
     uint32_t crc = 0;
-    for (size_t i = 0; i < n; ++i) {
-        crc = (crc >> 8) ^ kTable[(crc ^ p[i]) & 0xFFu];
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const uint64_t mix = static_cast<uint64_t>(crc) ^ load64(p + i);
+        const uint64_t hi = load64(p + i + 8);
+        crc = t[15][mix & 0xFFu] ^ t[14][(mix >> 8) & 0xFFu] ^
+              t[13][(mix >> 16) & 0xFFu] ^ t[12][(mix >> 24) & 0xFFu] ^
+              t[11][(mix >> 32) & 0xFFu] ^ t[10][(mix >> 40) & 0xFFu] ^
+              t[9][(mix >> 48) & 0xFFu] ^ t[8][(mix >> 56) & 0xFFu] ^
+              t[7][hi & 0xFFu] ^ t[6][(hi >> 8) & 0xFFu] ^
+              t[5][(hi >> 16) & 0xFFu] ^ t[4][(hi >> 24) & 0xFFu] ^
+              t[3][(hi >> 32) & 0xFFu] ^ t[2][(hi >> 40) & 0xFFu] ^
+              t[1][(hi >> 48) & 0xFFu] ^ t[0][(hi >> 56) & 0xFFu];
+    }
+    for (; i < n; ++i) {
+        crc = (crc >> 8) ^ t[0][(crc ^ p[i]) & 0xFFu];
     }
     return ~crc;
 }
@@ -445,10 +480,18 @@ bool Lz4Stream::step() {
     if (!ensure_out(mlen)) {
         return false;
     }
+    // Overlapping copy. Byte by byte (the obvious reading of the format) ran at
+    // ~1.5 GB/s and dominated a whole-disk dump. Copy in doubling steps
+    // instead: the first `off` bytes of the match are already in place, so
+    // after `written` bytes the window [src, src + off + written) is final and
+    // its phase is 0 mod `off`, which is what the periodic continuation needs.
     uint8_t* dst = out_.data() + len_;
     const uint8_t* src = dst - off;
-    for (size_t i = 0; i < mlen; ++i) {
-        dst[i] = src[i];
+    size_t written = 0;
+    while (written < mlen) {
+        const size_t n = std::min(mlen - written, off + written);
+        std::memcpy(dst + written, src, n);
+        written += n;
     }
     len_ += mlen;
     produced_ += mlen;

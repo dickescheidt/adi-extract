@@ -4,6 +4,7 @@
 #include "codec.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <cctype>
 #include <cstring>
@@ -27,6 +28,11 @@ constexpr size_t kVdbSize = 0x20;
 constexpr size_t kMaxRecord = 1u << 20;
 constexpr size_t kChunk = 4u << 20;
 constexpr size_t kOverlap = kStdHdr - 1;
+/// Bytes at the end of the primary member searched before the whole file.
+/// AOMEI writes the record block after the payload, so the real image's
+/// records sit in the last few kilobytes; four MiB leaves room for hundreds of
+/// volumes and replaces a full pass over a 70 GiB file.
+constexpr uint64_t kTailWindow = 4ull << 20;
 
 uint32_t rd32(const uint8_t* p) {
     return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
@@ -148,11 +154,11 @@ bool is_standard_type(uint32_t t) {
            t == kCompress || t == kEncrypt || t == kRegion;
 }
 
-std::vector<Header> scan_headers(const AdiFile& file) {
+std::vector<Header> scan_headers_range(const AdiFile& file, uint64_t from, uint64_t to) {
     std::vector<uint64_t> candidates;
-    const uint64_t end = file.file_size();
+    const uint64_t end = std::min<uint64_t>(to, file.file_size());
     std::vector<uint8_t> buf(kChunk + kOverlap);
-    uint64_t at = 0;
+    uint64_t at = from;
     while (at < end) {
         const size_t want =
             static_cast<size_t>(std::min<uint64_t>(kChunk + kOverlap, end - at));
@@ -176,6 +182,10 @@ std::vector<Header> scan_headers(const AdiFile& file) {
         }
     }
     return out;
+}
+
+std::vector<Header> scan_headers(const AdiFile& file) {
+    return scan_headers_range(file, 0, file.file_size());
 }
 
 bool parse_data_block_index(const Header& h, const std::vector<uint8_t>& raw,
@@ -331,8 +341,7 @@ struct Set {
     std::vector<VdbEntry> entries;
 };
 
-std::vector<Set> find_sets(const AdiFile& file) {
-    const auto headers = scan_headers(file);
+std::vector<Set> build_sets(const AdiFile& file, const std::vector<Header>& headers) {
     std::vector<DataBlockIndex> data_blocks;
     for (const auto& h : headers) {
         if (h.rec_type != kDataBlockIndex) {
@@ -529,6 +538,71 @@ std::vector<Set> find_sets(const AdiFile& file) {
         }
     }
     return sets;
+}
+
+/// Structural sanity gate for the tail scan. A set that passes is one the
+/// parser could have produced from a complete record block: the declared VDB
+/// count is what was read, every entry addresses stored bytes inside the image
+/// set, and at least one entry is the first block of a region. A set that
+/// fails sends the caller through the exhaustive scan, so a false negative
+/// only costs time.
+bool set_is_plausible(const AdiFile& file, const Set& set) {
+    if (set.entries.empty() || set.regions.empty()) {
+        return false;
+    }
+    if (set.entries.size() != set.entry_count || set.metadata.empty()) {
+        return false;
+    }
+    uint64_t logical_end = 0;
+    for (const auto& m : file.image_set().members()) {
+        logical_end = std::max(logical_end, m.logical_start + m.data_length);
+    }
+    if (logical_end == 0) {
+        return false;
+    }
+    bool first_block = false;
+    for (const auto& e : set.entries) {
+        if (e.old_size == 0 || e.new_size == 0) {
+            return false;
+        }
+        if (e.img_offset > logical_end || e.new_size > logical_end - e.img_offset) {
+            return false;
+        }
+        if (e.block_no == 0) {
+            first_block = true;
+        }
+    }
+    return first_block;
+}
+
+std::vector<Set> find_sets(const AdiFile& file) {
+    // Reading the whole file to find a record block that is normally in the
+    // last few kilobytes costs a full pass over the image (70 s for 70 GiB at
+    // 1 GB/s) before the first output byte. Search the tail first and accept
+    // it only when it yields exactly one complete, self-consistent record set;
+    // otherwise fall back to the exhaustive scan, which is what older images
+    // and unusual layouts get. ADI_EXTRACT_FULL_SCAN=1 forces that scan.
+    if (std::getenv("ADI_EXTRACT_FULL_SCAN") == nullptr && file.file_size() > kTailWindow) {
+        const auto headers =
+            scan_headers_range(file, file.file_size() - kTailWindow, file.file_size());
+        size_t indexes = 0;
+        for (const auto& h : headers) {
+            if (h.rec_type == kVolumeIndex) {
+                ++indexes;
+            }
+        }
+        std::vector<Set> sets = build_sets(file, headers);
+        if (indexes == 1 && sets.size() == 1 && set_is_plausible(file, sets[0])) {
+            adi::debug_log() << "  trace: record scan: last " << kTailWindow << " bytes of "
+                             << file.file_size() << " (one 0x201, complete set)\n";
+            return sets;
+        }
+        adi::debug_log() << "  trace: record scan: last " << kTailWindow << " bytes gave "
+                         << indexes << " 0x201 record(s) and " << sets.size()
+                         << " usable set(s); scanning the whole file\n";
+    }
+    adi::debug_log() << "  trace: record scan: whole file (" << file.file_size() << " bytes)\n";
+    return build_sets(file, scan_headers(file));
 }
 
 }  // namespace
